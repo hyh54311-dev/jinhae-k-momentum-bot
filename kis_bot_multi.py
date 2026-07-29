@@ -725,8 +725,8 @@ def main():
     
     is_force = len(sys.argv) > 1 and sys.argv[1] == "--force"
     
-    # [핵심 복구] 7월 17일 제헌절 미집행 건 ➔ 7월 21일~31일 이월 자동 실행 허용
-    is_special_july = (datetime.date(2026, 7, 21) <= today <= datetime.date(2026, 7, 31))
+    # [7월 이월 마감] 7월 27일 7월 리밸런싱 및 매수 집행이 완료되었으므로 이월 게이트 해제
+    is_special_july = False
     
     if today != actual_rebalance_date and not is_special_july:
         if not (KIS_DRY_RUN or KIS_MOCK or is_force):

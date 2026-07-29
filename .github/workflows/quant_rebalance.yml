@@ -2,8 +2,8 @@ name: K-Dual Momentum Quant Bot Auto Rebalance
 
 on:
   schedule:
-    # 매달 17일~31일 한국시간 15:15 (UTC 06:15) 트리거
-    - cron: '15 6 17-31 * *'
+    # 매달 17일~31일 한국시간 14:55 (UTC 05:55) 트리거 (장 마감 35분 전 여유 집행 및 큐 지연 방지)
+    - cron: '55 5 17-31 * *'
   workflow_dispatch:
     inputs:
       dry_run:

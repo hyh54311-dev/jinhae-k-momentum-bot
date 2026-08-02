@@ -212,7 +212,7 @@ def get_access_token():
 
 def get_orderable_cash(token, cano, prdt_cd, ticker="069500"):
     url = f"{URL_BASE}/uapi/domestic-stock/v1/trading/inquire-psbl-order"
-    is_mock = KIS_MOCK or "openapim" in URL_BASE
+    is_mock = KIS_MOCK or "openapivts" in URL_BASE
     tr_id = "VTTC8908R" if is_mock else "TTTC8908R"
     
     headers = {
@@ -258,7 +258,7 @@ def get_orderable_cash(token, cano, prdt_cd, ticker="069500"):
 
 def get_account_balance(token, cano, prdt_cd):
     url = f"{URL_BASE}/uapi/domestic-stock/v1/trading/inquire-balance"
-    is_mock = KIS_MOCK or "openapim" in URL_BASE
+    is_mock = KIS_MOCK or "openapivts" in URL_BASE
     tr_id = "VTTC8434R" if is_mock else "TTTC8434R"
     
     headers = {
@@ -339,12 +339,12 @@ def get_account_balance(token, cano, prdt_cd):
     return cash, holdings
 
 def submit_order(token, cano, prdt_cd, ticker, qty, order_type="BUY", price=0, ord_dvsn="00"):
-    is_mock = KIS_MOCK or "openapim" in URL_BASE
+    is_mock = KIS_MOCK or "openapivts" in URL_BASE
     
     if order_type == "BUY":
-        tr_id = "VTTC0012U" if is_mock else "TTTC0012U"
+        tr_id = "VTTC0802U" if is_mock else "TTTC0802U"
     else:
-        tr_id = "VTTC0011U" if is_mock else "TTTC0011U"
+        tr_id = "VTTC0801U" if is_mock else "TTTC0801U"
         
     url = f"{URL_BASE}/uapi/domestic-stock/v1/trading/order-cash"
     
@@ -492,7 +492,8 @@ def calculate_momentum_signals(token):
             ticker = SHORT_SYMBOLS[name]
             prices = get_historical_prices(symbol, ticker)
             prices_dict[name] = prices
-            returns_12m[name] = (prices[-1] - prices[-13]) / prices[-13]
+            base_p = prices[-13] if (len(prices) >= 13 and prices[-13] > 0) else 1.0
+            returns_12m[name] = (prices[-1] - base_p) / base_p
         except Exception as e:
             raise Exception(f"🚨 모멘텀 계산 중 {name}({symbol}) 분석 실패: {e}")
         time.sleep(0.5)

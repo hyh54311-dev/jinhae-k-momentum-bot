@@ -2,7 +2,7 @@ name: K-Dual Momentum Quant Bot Auto Rebalance
 
 on:
   schedule:
-    # 매달 17일~31일 한국시간 12:30 (UTC 03:30) 트리거 (장 마감 3시간 전 여유 집행)
+    # 매달 17일~31일 한국시간 12:30 (UTC 03:30) 무인 스케줄러 트리거
     - cron: '30 3 17-31 * *'
   workflow_dispatch:
     inputs:
@@ -15,9 +15,15 @@ on:
         required: false
         default: 'false'
 
+# 동시 실행(중복 주문) 방지 락
+concurrency:
+  group: kis-rebalance-bot
+  cancel-in-progress: false
+
 jobs:
   rebalance:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout Repository
@@ -39,6 +45,10 @@ jobs:
           KIS_MOMENTUM_APP_SECRET: ${{ secrets.KIS_MOMENTUM_APP_SECRET }}
           KIS_PENSION_CANO: ${{ secrets.KIS_PENSION_CANO }}
           KIS_STOCK_CANO: ${{ secrets.KIS_STOCK_CANO }}
+          KIS_MOCK_APP_KEY: ${{ secrets.KIS_MOCK_APP_KEY }}
+          KIS_MOCK_APP_SECRET: ${{ secrets.KIS_MOCK_APP_SECRET }}
+          KIS_MOCK_CANO1: ${{ secrets.KIS_MOCK_CANO1 }}
+          KIS_MOCK_CANO2: ${{ secrets.KIS_MOCK_CANO2 }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           KIS_MOCK: ${{ secrets.KIS_MOCK || 'False' }}

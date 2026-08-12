@@ -1,0 +1,21 @@
+name: Monthly Keep-Alive
+
+on:
+  schedule:
+    - cron: '0 0 1 * *'   # 매월 1일 자정(UTC)에 딱 1회 실행
+
+jobs:
+  keep-alive:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write     # [중요] 생존 신고 커밋을 위한 쓰기 권한
+    steps:
+      - uses: actions/checkout@v4
+      - name: Update Keep-Alive Timestamp
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          date -u > last_run.txt
+          git add last_run.txt
+          git diff --staged --quiet || git commit -m "chore: Monthly keep-alive [skip ci]"
+          git push

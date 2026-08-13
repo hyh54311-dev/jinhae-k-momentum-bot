@@ -111,7 +111,7 @@ def init_config():
             {"name": "개인주식계좌", "cano": os.getenv("KIS_STOCK_CANO", "").strip(), "prdt_cd": "01"}
         ]
 
-init_config()
+
 
 def send_telegram(msg):
     prefix = ""
@@ -687,10 +687,16 @@ def rebalance_account(token, acc, target_weights):
             buy_results.append(f"❌ {ticker} {buy_qty}주 매수 실패! ({res.get('msg1')})")
         time.sleep(1.5)
 
+    if buy_results:
+        print(">> 매수 후 최신 수량 갱신을 위해 잔고를 다시 조회합니다...")
+        time.sleep(2)
+        _, holdings = get_account_balance(token, cano, prdt_cd)
+
     status_summary = []
     for ticker, weight in target_weights.items():
         curr_qty = holdings.get(ticker, {}).get("qty", 0)
         status_summary.append(f"{ticker}(목표비중 {weight*100:.0f}%, 현재수량 {curr_qty}주)")
+
         
     msg = f"🔄 [{name}] 리밸런싱 완료\n- 목표 분할: {', '.join(status_summary)}\n"
     if buy_results:

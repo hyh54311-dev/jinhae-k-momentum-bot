@@ -603,6 +603,13 @@ def rebalance_account(token, acc, target_weights):
     
     for ticker, weight in target_weights.items():
         price, tick_size = get_current_price(ticker)
+        if price is None:
+            err = (f"🚨 [가동 중단] {ticker} 현재가 조회 3중 실패.\n"
+                   f"잘못된 가격으로 주문하지 않도록 이번 달 리밸런싱을 건너뜁니다.\n"
+                   f"다음 영업일에 수동으로 --force 실행해 주세요.")
+            send_telegram(err)
+            raise ValueError(err)
+            
         price = math.ceil(price / tick_size) * tick_size
         prices[ticker] = price
         target_val = total_asset * weight

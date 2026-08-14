@@ -26,7 +26,7 @@ if sys.platform.startswith("win"):
 # .env 파일에서 계좌 정보 및 API 키 로드용 전역 변수 기본 설정
 KIS_MOCK = False
 KIS_DRY_RUN = False
-MAX_ORDER_AMOUNT = 100000000
+MAX_ORDER_AMOUNT = 1000000000
 APP_KEY = ""
 APP_SECRET = ""
 URL_BASE = ""
@@ -77,7 +77,7 @@ def init_config():
 
     KIS_MOCK = os.getenv("KIS_MOCK", "False").lower() in ("true", "1", "yes")
     KIS_DRY_RUN = os.getenv("KIS_DRY_RUN", "False").lower() in ("true", "1", "yes")
-    MAX_ORDER_AMOUNT = int(os.getenv("MAX_ORDER_AMOUNT", "100000000"))
+    MAX_ORDER_AMOUNT = int(os.getenv("MAX_ORDER_AMOUNT", "1000000000"))
     TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
@@ -550,12 +550,12 @@ def rebalance_account(token, acc, target_weights):
     print(f">> 예수금: {cash:,}원 | 주식평가액: {total_holdings_eval:,}원 | 총자산: {total_asset:,}원")
     
     if total_asset == 0:
-        print(f">> [{name}] 계좌 자산이 0원이므로 건너끁니다.")
+        print(f">> [{name}] 계좌 자산이 0원이므로 건너뜁니다.")
         return f"⚠️ [{name}] 자산 없음 실행 스킵"
 
     def get_current_price(ticker):
         price = 0.0
-        tick_size = 5
+        tick_size = 0
         try:
             url_price = f"{URL_BASE}/uapi/domestic-stock/v1/quotations/inquire-price"
             headers = {
@@ -578,22 +578,28 @@ def rebalance_account(token, acc, target_weights):
         except Exception as e:
             print(f"⚠️ KIS 현재가 조회 실패: {e}")
             
+        # [2차 폴백] 잔고 조회에 담긴 실시간 현재가(prpr) 재활용
+        if price <= 0 and ticker in holdings:
+            price = float(holdings[ticker].get("price", 0))
+            if price > 0:
+                print(f" - [2차 폴백] 잔고 현재가 적용: {price:,.0f}원")
+                
+        # [3차 폴백] 월봉 최근 종가 재활용
         if price <= 0:
-            fallback_prices = {
-                TICKER_KOSPI: 137000.0, TICKER_SP500: 18000.0,
-                TICKER_GOLD: 140000.0, TICKER_TLT: 10000.0, TICKER_SAFE: 11000.0
-            }
-            price = fallback_prices.get(ticker, 10000.0)
+            try:
+                monthly = get_historical_prices_kis(ticker, token)
+                if monthly:
+                    price = float(monthly[-1])
+                    print(f" - [3차 폴백] 월봉 최근 종가 적용: {price:,.0f}원")
+            except Exception:
+                pass
+                
+        # 3중 폴백 모두 실패 → 하드코딩 가격 대신 None 반환
+        if price <= 0:
+            return None, None
             
-        stock_tick = 5
-        if price < 2000: stock_tick = 1
-        elif price < 5000: stock_tick = 5
-        elif price < 20000: stock_tick = 10
-        elif price < 50000: stock_tick = 50
-        elif price < 100000: stock_tick = 100
-        else: stock_tick = 1000
-            
-        final_tick = max(tick_size, stock_tick)
+        # ETF는 전 가격대 5원 호가 고정
+        final_tick = tick_size if tick_size > 0 else 5
         return price, final_tick
 
     # 1. 1단계: 초과 비중 매도

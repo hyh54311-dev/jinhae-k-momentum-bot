@@ -53,7 +53,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           KIS_MOCK: ${{ secrets.KIS_MOCK || 'False' }}
           KIS_DRY_RUN: ${{ github.event.inputs.dry_run || secrets.KIS_DRY_RUN || 'False' }}
-          MAX_ORDER_AMOUNT: ${{ secrets.MAX_ORDER_AMOUNT || '100000000' }}
+          MAX_ORDER_AMOUNT: ${{ secrets.MAX_ORDER_AMOUNT || '1000000000' }}
         run: |
           if [ "${{ github.event.inputs.force }}" = "true" ]; then
             python kis_bot_multi.py --force

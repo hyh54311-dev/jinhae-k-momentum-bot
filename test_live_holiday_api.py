@@ -17,7 +17,15 @@ import json
 import requests
 from dotenv import load_dotenv
 
-# .env 로드 (현재 디렉터리 또는 상위 디렉터리)
+# Windows 콘솔 인코딩 대응
+if sys.platform.startswith("win"):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8')
+    except AttributeError:
+        pass
+
+# .env 로드
 load_dotenv()
 if not os.getenv("KIS_MOMENTUM_APP_KEY") and not os.getenv("KIS_APP_KEY"):
     parent_env = os.path.join(os.path.dirname(__file__), "..", ".env")

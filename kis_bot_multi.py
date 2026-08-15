@@ -712,7 +712,9 @@ def rebalance_account(token, acc, target_weights):
             continue
 
         if amount > MAX_ORDER_AMOUNT:
-            raise ValueError(f"🚨 [Fat Finger 차단] 주문금액 {amount:,}원 > 최대 제한 금액 {MAX_ORDER_AMOUNT:,}원")
+            print(f"⚠️ [한도 초과 스킵] {ticker} 주문금액({amount:,}원) > 최대 제한 한도({MAX_ORDER_AMOUNT:,}원)")
+            buy_results.append(f"⚠️ {ticker} 매수 스킵 (주문 한도 초과)")
+            continue
             
         print(f"➔ [지정가 매수] {ticker} ({buy_qty}주, 단가: {price:,}원, 금액: {amount:,}원)")
         res = submit_order(token, cano, prdt_cd, ticker, buy_qty, "BUY", price=price, ord_dvsn="00")

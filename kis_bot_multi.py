@@ -266,7 +266,8 @@ def get_account_balance(token, cano, prdt_cd):
         "authorization": f"Bearer {token}",
         "appkey": APP_KEY,
         "appsecret": APP_SECRET,
-        "tr_id": tr_id
+        "tr_id": tr_id,
+        "custtype": "P"
     }
     params = {
         "CANO": cano,
@@ -341,10 +342,11 @@ def get_account_balance(token, cano, prdt_cd):
 def submit_order(token, cano, prdt_cd, ticker, qty, order_type="BUY", price=0, ord_dvsn="00"):
     is_mock = KIS_MOCK or "openapivts" in URL_BASE
     
+    # [KIS 공식 최신 규격] 신규 TR ID 적용 (구TR: TTTC0801U/0802U 폐기 예정 대비)
     if order_type == "BUY":
-        tr_id = "VTTC0802U" if is_mock else "TTTC0802U"
+        tr_id = "VTTC0012U" if is_mock else "TTTC0012U"
     else:
-        tr_id = "VTTC0801U" if is_mock else "TTTC0801U"
+        tr_id = "VTTC0011U" if is_mock else "TTTC0011U"
         
     url = f"{URL_BASE}/uapi/domestic-stock/v1/trading/order-cash"
     
@@ -359,11 +361,12 @@ def submit_order(token, cano, prdt_cd, ticker, qty, order_type="BUY", price=0, o
         }
         
     headers = {
-        "content-type": "application/json",
+        "content-type": "application/json; charset=utf-8",
         "authorization": f"Bearer {token}",
         "appkey": APP_KEY,
         "appsecret": APP_SECRET,
-        "tr_id": tr_id
+        "tr_id": tr_id,
+        "custtype": "P"
     }
     
     unpr = "0" if ord_dvsn == "01" else str(int(price))
@@ -401,7 +404,8 @@ def get_historical_prices_kis(ticker, token):
         "authorization": f"Bearer {token}",
         "appkey": APP_KEY,
         "appsecret": APP_SECRET,
-        "tr_id": "FHKST03010100"
+        "tr_id": "FHKST03010100",
+        "custtype": "P"
     }
     
     kst_tz = datetime.timezone(datetime.timedelta(hours=9))
@@ -562,7 +566,8 @@ def rebalance_account(token, acc, target_weights):
                 "authorization": f"Bearer {token}",
                 "appkey": APP_KEY,
                 "appsecret": APP_SECRET,
-                "tr_id": "FHKST01010100"
+                "tr_id": "FHKST01010100",
+                "custtype": "P"
             }
             params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": ticker}
             res_price = kis_api_request("GET", url_price, headers=headers, params=params)
@@ -720,9 +725,58 @@ def rebalance_account(token, acc, target_weights):
     print(msg)
     return msg
 
-def get_actual_rebalance_date(year, month):
+def fetch_holiday_calendar_kis(base_date, token):
+    """KIS 공식 국내휴장일조회 API (CTCA0903R) 호출 - 24일치 개장여부 일괄 조회"""
+    if not token or not URL_BASE or "openapivts" in URL_BASE:
+        return None
+    try:
+        url = f"{URL_BASE}/uapi/domestic-stock/v1/quotations/chk-holiday"
+        headers = {
+            "content-type": "application/json; charset=utf-8",
+            "authorization": f"Bearer {token}",
+            "appkey": APP_KEY,
+            "appsecret": APP_SECRET,
+            "tr_id": "CTCA0903R",
+            "custtype": "P"
+        }
+        params = {
+            "BASS_DT": base_date.strftime("%Y%m%d"),
+            "CTX_AREA_NK": "",
+            "CTX_AREA_FK": ""
+        }
+        res = kis_api_request("GET", url, headers=headers, params=params)
+        if res.status_code == 200:
+            data = res.json()
+            if data.get("rt_cd") == "0":
+                output = data.get("output", [])
+                if isinstance(output, list) and output:
+                    return {item.get("bass_dt"): item.get("opnd_yn") for item in output if "bass_dt" in item}
+    except Exception as e:
+        print(f"⚠️ KIS 휴장일 API 조회 실패: {e}")
+    return None
+
+def get_actual_rebalance_date(year, month, token=None):
+    """
+    [하이브리드 휴장일 계산]
+    1. KIS 공식 국내휴장일조회 API (CTCA0903R) 우선 호출하여 개장일(opnd_yn == 'Y') 판정
+    2. API 실패 또는 모의투자/토큰 부재 시 KRX_HOLIDAYS 하드코딩 캘린더로 자동 폴백
+    """
     target_day = 17
-    check_date = datetime.date(year, month, target_day)
+    base_date = datetime.date(year, month, target_day)
+    
+    # 1. KIS 공식 휴장일 API (CTCA0903R) 1회 호출 시도
+    if token:
+        holidays = fetch_holiday_calendar_kis(base_date, token)
+        if holidays:
+            for i in range(24):
+                d = base_date + datetime.timedelta(days=i)
+                dt_str = d.strftime("%Y%m%d")
+                if holidays.get(dt_str) == "Y":
+                    print(f">> [CTCA0903R] KIS 공식 개장일 확인: {d.strftime('%Y-%m-%d')}")
+                    return d
+                    
+    # 2. 폴백: KRX_HOLIDAYS 하드코딩 캘린더
+    check_date = base_date
     while True:
         if check_date.weekday() >= 5:
             check_date += datetime.timedelta(days=1)
@@ -736,7 +790,16 @@ def main():
     init_config()
     kst_tz = datetime.timezone(datetime.timedelta(hours=9))
     today = datetime.datetime.now(kst_tz).date()
-    actual_rebalance_date = get_actual_rebalance_date(today.year, today.month)
+    
+    # KIS API 토큰 사전 발급 (휴장일 조회 및 본 매매에 활용)
+    token = None
+    if APP_KEY and APP_SECRET and not KIS_DRY_RUN:
+        try:
+            token = get_token()
+        except Exception as te:
+            print(f"⚠️ 초기 토큰 발급 예외: {te}")
+            
+    actual_rebalance_date = get_actual_rebalance_date(today.year, today.month, token=token)
     
     print(f">> [실행일 점검] 이번 달 리밸런싱 예정일: {actual_rebalance_date} (오늘: {today})")
     

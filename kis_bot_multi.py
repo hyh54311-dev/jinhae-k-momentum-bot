@@ -196,6 +196,19 @@ def is_market_open():
     end_time = now.replace(hour=15, minute=30, second=0, microsecond=0)
     return start_time <= now <= end_time
 
+def kis_headers(token, tr_id, is_post=False):
+    """KIS 공통 헤더 생성 (custtype: 'P' 필수 포함 규격 준수)"""
+    return {
+        "content-type": "application/json; charset=utf-8",
+        "authorization": f"Bearer {token}",
+        "appkey": APP_KEY,
+        "appsecret": APP_SECRET,
+        "tr_id": tr_id,
+        "custtype": "P"
+    }
+
+_holiday_cache = {}  # 휴장일 API 1일 1회 호출 보장용 캐시
+
 def get_access_token():
     url = f"{URL_BASE}/oauth2/tokenP"
     headers = {"content-type": "application/json"}
@@ -726,21 +739,22 @@ def rebalance_account(token, acc, target_weights):
     return msg
 
 def fetch_holiday_calendar_kis(base_date, token):
-    """KIS 공식 국내휴장일조회 API (CTCA0903R) 호출 - 24일치 개장여부 일괄 조회"""
+    """
+    KIS 공식 국내휴장일조회 API (CTCA0903R) 호출.
+    BASS_DT 기준 약 24일치 개장일 데이터를 1회 조회하며, 당일 1회 호출 캐싱(_holiday_cache)을 준수합니다.
+    """
     if not token or not URL_BASE or "openapivts" in URL_BASE:
         return None
+        
+    key = base_date.strftime("%Y%m%d")
+    if key in _holiday_cache:
+        return _holiday_cache[key]
+        
     try:
         url = f"{URL_BASE}/uapi/domestic-stock/v1/quotations/chk-holiday"
-        headers = {
-            "content-type": "application/json; charset=utf-8",
-            "authorization": f"Bearer {token}",
-            "appkey": APP_KEY,
-            "appsecret": APP_SECRET,
-            "tr_id": "CTCA0903R",
-            "custtype": "P"
-        }
+        headers = kis_headers(token, "CTCA0903R")
         params = {
-            "BASS_DT": base_date.strftime("%Y%m%d"),
+            "BASS_DT": key,
             "CTX_AREA_NK": "",
             "CTX_AREA_FK": ""
         }
@@ -749,42 +763,46 @@ def fetch_holiday_calendar_kis(base_date, token):
             data = res.json()
             if data.get("rt_cd") == "0":
                 output = data.get("output", [])
-                if isinstance(output, list) and output:
-                    return {item.get("bass_dt"): item.get("opnd_yn") for item in output if "bass_dt" in item}
+                if isinstance(output, dict):
+                    output = [output]
+                cal = {r.get("bass_dt"): r.get("opnd_yn") for r in output if r.get("bass_dt")}
+                if cal:
+                    _holiday_cache[key] = cal
+                    print(f">> [CTCA0903R] KIS 공식 휴장일 캘린더 수신 완료 ({len(cal)}일치)")
+                    return cal
     except Exception as e:
         print(f"⚠️ KIS 휴장일 API 조회 실패: {e}")
     return None
 
 def get_actual_rebalance_date(year, month, token=None):
     """
-    [하이브리드 휴장일 계산]
-    1. KIS 공식 국내휴장일조회 API (CTCA0903R) 우선 호출하여 개장일(opnd_yn == 'Y') 판정
-    2. API 실패 또는 모의투자/토큰 부재 시 KRX_HOLIDAYS 하드코딩 캘린더로 자동 폴백
+    [하이브리드 휴장일 계산 엔진]
+    1순위: KIS 공식 국내휴장일조회 API (CTCA0903R) - 2027년 이후 공휴일도 100% 자동 대응
+    2순위: KRX_HOLIDAYS 하드코딩 캘린더 (모의투자 또는 KIS 일시 통신 장애 시 안전 폴백)
     """
     target_day = 17
-    base_date = datetime.date(year, month, target_day)
+    base = datetime.date(year, month, target_day)
     
-    # 1. KIS 공식 휴장일 API (CTCA0903R) 1회 호출 시도
+    # 1순위: 공식 API 판정
     if token:
-        holidays = fetch_holiday_calendar_kis(base_date, token)
-        if holidays:
+        cal = fetch_holiday_calendar_kis(base, token)
+        if cal:
             for i in range(24):
-                d = base_date + datetime.timedelta(days=i)
-                dt_str = d.strftime("%Y%m%d")
-                if holidays.get(dt_str) == "Y":
+                d = base + datetime.timedelta(days=i)
+                if cal.get(d.strftime("%Y%m%d")) == "Y":
                     print(f">> [CTCA0903R] KIS 공식 개장일 확인: {d.strftime('%Y-%m-%d')}")
                     return d
-                    
-    # 2. 폴백: KRX_HOLIDAYS 하드코딩 캘린더
-    check_date = base_date
-    while True:
-        if check_date.weekday() >= 5:
-            check_date += datetime.timedelta(days=1)
-            continue
-        if check_date.strftime("%Y-%m-%d") in KRX_HOLIDAYS:
-            check_date += datetime.timedelta(days=1)
-            continue
-        return check_date
+            print("⚠️ 캘린더 범위 내 개장일 없음 ➔ 하드코딩 폴백 전환")
+            
+    # 2순위: 하드코딩 폴백 (무한루프 방지 guard 추가)
+    check = base
+    guard = 0
+    while check.weekday() >= 5 or check.strftime("%Y-%m-%d") in KRX_HOLIDAYS:
+        check += datetime.timedelta(days=1)
+        guard += 1
+        if guard > 30:
+            break
+    return check
 
 def main():
     init_config()
@@ -795,7 +813,7 @@ def main():
     token = None
     if APP_KEY and APP_SECRET and not KIS_DRY_RUN:
         try:
-            token = get_token()
+            token = get_access_token()
         except Exception as te:
             print(f"⚠️ 초기 토큰 발급 예외: {te}")
             

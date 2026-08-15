@@ -5,7 +5,7 @@
 =============================================================================
  * 검증 목적:
    1. 실전 연금저축 계좌(prdt_cd="22")에서 신TR ID 정상 주문 접수 여부
-   2. 매수 신TR: TTTC0012U (지정가 ORD_DVSN="00", 5원 호가)
+   2. 매수 신TR: TTTC0012U (지정가 ORD_DVSN="00", 5원 호가 +20원 즉시 체결 유도)
    3. 매도 신TR: TTTC0011U (시장가 ORD_DVSN="01", 단가="0")
  * 대상 종목: TIGER 미국달러단기채권액티브 (329750, 1주 약 1.1만 원)
  * 주의: 평일 장중(09:00 ~ 15:30)에 실행 시 실제 1주 매수 및 매도가 집행됩니다.
@@ -69,6 +69,9 @@ if token_res.status_code != 200:
 token = token_res.json().get("access_token")
 print("✅ 토큰 발급 성공!")
 
+# [수정 1] order_url을 전역 스코프로 이동하여 매수/매도 블록 모두 안전하게 공유
+order_url = f"{URL_BASE}/uapi/domestic-stock/v1/trading/order-cash"
+
 # 2. 현재가 및 호가 조회 (FHKST01010100)
 price_url = f"{URL_BASE}/uapi/domestic-stock/v1/quotations/inquire-price"
 headers_price = {
@@ -86,9 +89,15 @@ params_price = {
 price_res = requests.get(price_url, headers=headers_price, params=params_price, timeout=10)
 curr_price = float(price_res.json().get("output", {}).get("stck_prpr", 0))
 
-# 5원 호가 올림 적용
-buy_price = int(math.ceil(curr_price / 5) * 5)
-print(f"2. {TEST_NAME}({TEST_TICKER}) 현재가: {curr_price:,.0f}원 ➔ 5원 호가 매수 지정가: {buy_price:,}원")
+# [수정 4] 현재가 조회 실패 가드
+if curr_price <= 0:
+    print(f"❌ 현재가 조회 실패 (수신값: {curr_price}). 장 운영시간(09:00~15:30) 및 종목코드를 확인하세요.")
+    sys.exit(1)
+
+# [수정 2] 검증용: 매도 1호가를 넘겨 즉시 체결 유도 (+20원 가산)
+# (지정가 매수이므로 실제 체결은 최우선 매도호가에서 즉시 체결되며 불필요한 과다 비용 미발생)
+buy_price = int(math.ceil(curr_price / 5) * 5) + 20
+print(f"2. {TEST_NAME}({TEST_TICKER}) 현재가: {curr_price:,.0f}원 ➔ 즉시 체결용 매수 지정가: {buy_price:,}원")
 
 # 3. [1단계] 1주 지정가 매수 실체결 테스트 (TTTC0012U)
 print("\n" + "="*68)
@@ -97,7 +106,6 @@ print("="*68)
 confirm_buy = input("정말 1주 매수 주문을 KIS 실전 서버로 전송하시겠습니까? (y/N): ").strip().lower()
 
 if confirm_buy == "y":
-    order_url = f"{URL_BASE}/uapi/domestic-stock/v1/trading/order-cash"
     headers_buy = {
         "content-type": "application/json; charset=utf-8",
         "authorization": f"Bearer {token}",
@@ -129,8 +137,14 @@ if confirm_buy == "y":
 else:
     print("ℹ️ 1단계 매수 테스트를 건너뛰었습니다.")
 
+# [수정 3] 매수-매도 사이 체결 확인 안내
+print("\n" + "-"*68)
+print("⚠️ 매도 전 필수 확인: 증권사 앱(MTS)에서 연금저축 계좌에 329750이")
+print("   실제로 1주 입고(체결 완료)되었는지 확인한 뒤 y를 입력하세요.")
+print("   (미체결 상태에서 매도하면 '주문가능수량 부족'으로 거부됩니다)")
+print("-" * 68)
+
 # 4. [2단계] 1주 시장가 매도 실체결 테스트 (TTTC0011U)
-print("\n" + "="*68)
 print(f"👉 [2단계: 매도 검증] 신TR 'TTTC0011U'로 1주 시장가(ORD_DVSN='01') 매도")
 print("="*68)
 confirm_sell = input("방금 매수된(또는 보유 중인) 1주를 시장가로 즉시 매도하시겠습니까? (y/N): ").strip().lower()

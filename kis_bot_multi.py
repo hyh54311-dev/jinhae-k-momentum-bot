@@ -639,6 +639,12 @@ def rebalance_account(token, acc, target_weights):
         target_val = total_asset * weight
         target_qtys[ticker] = int(target_val // price)
         
+        # [Fat Finger 사전 차단] 목표 주문 금액이 MAX_ORDER_AMOUNT를 초과하는지 매도 루프 '이전'에 사전 검증하여 안전 중단
+        if target_val > MAX_ORDER_AMOUNT:
+            err = f"🚨 [Fat Finger 차단] {ticker} 목표 주문금액({target_val:,.0f}원)이 최대 한도({MAX_ORDER_AMOUNT:,.0f}원)를 초과합니다."
+            send_telegram(err)
+            raise ValueError(err)
+        
     for ticker, info in holdings.items():
         curr_qty = info["qty"]
         target_qty = target_qtys.get(ticker, 0)

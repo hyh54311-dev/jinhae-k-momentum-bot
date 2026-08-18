@@ -209,7 +209,14 @@ def kis_headers(token, tr_id, is_post=False):
 
 _holiday_cache = {}  # 휴장일 API 1일 1회 호출 보장용 캐시
 
+_cached_token = None
+
 def get_access_token():
+    """KIS OAuth 2.0 접근 토큰 발급 및 세션 내 캐싱 (EGW00133 1분당 1회 빈도제한 자동 방어)"""
+    global _cached_token
+    if _cached_token:
+        return _cached_token
+        
     url = f"{URL_BASE}/oauth2/tokenP"
     headers = {"content-type": "application/json"}
     body = {
@@ -219,8 +226,21 @@ def get_access_token():
     }
     res = kis_api_request("POST", url, headers=headers, data=json.dumps(body))
     if res.status_code == 200:
-        return res.json()["access_token"]
+        _cached_token = res.json()["access_token"]
+        return _cached_token
     else:
+        # EGW00133 (1분당 1회 제한) 발생 시 65초 대기 후 1회 자동 재시도
+        try:
+            err_data = res.json()
+            if err_data.get("error_code") == "EGW00133":
+                print("⏳ KIS 접근토큰 발급 빈도 제한(EGW00133, 1분당 1회) 감지. 65초 대기 후 자동 재시도합니다...")
+                time.sleep(65)
+                res_retry = kis_api_request("POST", url, headers=headers, data=json.dumps(body))
+                if res_retry.status_code == 200:
+                    _cached_token = res_retry.json()["access_token"]
+                    return _cached_token
+        except Exception:
+            pass
         raise Exception(f"토큰 발급 오류 (모드_모의={KIS_MOCK}): {res.text}")
 
 def get_orderable_cash(token, cano, prdt_cd, ticker="069500"):
@@ -859,7 +879,8 @@ def main():
             print("⚠️ [영업시간 외 우회] 장이 닫혀 있으나 테스트 모드이므로 계속 진행합니다.")
 
     try:
-        token = get_access_token()
+        if not token:
+            token = get_access_token()
         target_weights, reason = calculate_momentum_signals(token)
         
         weights_detail = [f"{TICKER_NAMES.get(t, t)} ({t}): {w*100:.0f}%" for t, w in target_weights.items()]

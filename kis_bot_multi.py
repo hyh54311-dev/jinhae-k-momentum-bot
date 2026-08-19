@@ -26,6 +26,7 @@ if sys.platform.startswith("win"):
 # .env 파일에서 계좌 정보 및 API 키 로드용 전역 변수 기본 설정
 KIS_MOCK = False
 KIS_DRY_RUN = False
+DEBUG_MODE = False
 MAX_ORDER_AMOUNT = 1000000000
 APP_KEY = ""
 APP_SECRET = ""
@@ -67,7 +68,7 @@ KRX_HOLIDAYS = {
 
 def init_config():
     """실행 직전 최신 환경 변수를 읽어 동적 전역 변수를 완벽히 바인딩하는 함수"""
-    global KIS_MOCK, KIS_DRY_RUN, MAX_ORDER_AMOUNT, APP_KEY, APP_SECRET, URL_BASE, ACCOUNTS, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+    global KIS_MOCK, KIS_DRY_RUN, DEBUG_MODE, MAX_ORDER_AMOUNT, APP_KEY, APP_SECRET, URL_BASE, ACCOUNTS, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
     
     env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
     if os.path.exists(env_path):
@@ -77,6 +78,7 @@ def init_config():
 
     KIS_MOCK = os.getenv("KIS_MOCK", "False").lower() in ("true", "1", "yes")
     KIS_DRY_RUN = os.getenv("KIS_DRY_RUN", "False").lower() in ("true", "1", "yes")
+    DEBUG_MODE = os.getenv("DEBUG_MODE", "False").lower() in ("true", "1", "yes", "y")
     MAX_ORDER_AMOUNT = int(os.getenv("MAX_ORDER_AMOUNT", "1000000000"))
     TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -330,16 +332,18 @@ def get_account_balance(token, cano, prdt_cd):
         
         debug_msg = (
             f"🔍 [계좌 잔고 API 디버깅 - {prdt_cd}]\n"
-            f"- ord_psbl_cash(주문가능현금): {summary.get('ord_psbl_cash')} 원\n"
             f"- prvs_rcdl_excc_amt(당일정산금액): {summary.get('prvs_rcdl_excc_amt')} 원\n"
             f"- nxdy_excc_amt(익일정산금액): {summary.get('nxdy_excc_amt')} 원\n"
             f"- dnca_tot_amt(D+2예수금): {summary.get('dnca_tot_amt')} 원\n"
         )
-        send_telegram(debug_msg)
+        if DEBUG_MODE:
+            send_telegram(debug_msg)
+        print(debug_msg)
         
         # [핵심 수정] 0원이라도 주문가능현금(ord_psbl_cash)이 반환되면 우선 채택
         # D+2 예수금(dnca_tot_amt)으로 스킵되어 과다 주문되는 오류 방지
-        for field in ["ord_psbl_cash", "prvs_rcdl_excc_amt", "nxdy_excc_amt"]:
+        # [보완] TTTC8434R 잔고조회에서는 당일정산금액(prvs_rcdl_excc_amt)을 최우선 기준으로 채택
+        for field in ["prvs_rcdl_excc_amt", "nxdy_excc_amt"]:
             if field in summary and summary[field] is not None:
                 try:
                     cash = int(summary[field])
@@ -665,15 +669,18 @@ def rebalance_account(token, acc, target_weights):
             send_telegram(err)
             raise ValueError(err)
         
+    sell_results = []
     for ticker, info in holdings.items():
         curr_qty = info["qty"]
         target_qty = target_qtys.get(ticker, 0)
+        t_name = TICKER_NAMES.get(ticker, ticker)
         
         if target_qty == 0:
             print(f"➔ [전량 매도] {ticker} ({curr_qty}주)")
             res = submit_order(token, cano, prdt_cd, ticker, curr_qty, "SELL", ord_dvsn="01")
             if res.get("rt_cd") != "0":
                 raise Exception(f"🚨 [매도 실패] {ticker}: {res.get('msg1')}")
+            sell_results.append(f"전량 매도: {t_name} {curr_qty}주")
             sold_any = True
             time.sleep(1.5)
             
@@ -683,6 +690,7 @@ def rebalance_account(token, acc, target_weights):
             res = submit_order(token, cano, prdt_cd, ticker, sell_qty, "SELL", ord_dvsn="01")
             if res.get("rt_cd") != "0":
                 raise Exception(f"🚨 [매도 실패] {ticker}: {res.get('msg1')}")
+            sell_results.append(f"부분 매도: {t_name} {sell_qty}주 (잔여 {target_qty}주)")
             sold_any = True
             time.sleep(1.5)
 
@@ -751,19 +759,26 @@ def rebalance_account(token, acc, target_weights):
         time.sleep(2)
         _, holdings = get_account_balance(token, cano, prdt_cd)
 
-    status_summary = []
-    for ticker, weight in target_weights.items():
-        curr_qty = holdings.get(ticker, {}).get("qty", 0)
-        status_summary.append(f"{ticker}(목표비중 {weight*100:.0f}%, 현재수량 {curr_qty}주)")
-
+    # 최종 계좌 평가액 및 보유 현황 재조회
+    final_cash, final_holdings = get_account_balance(token, cano, prdt_cd)
+    final_total_eval = sum(info["eval_amt"] for info in final_holdings.values())
+    final_total_asset = final_cash + final_total_eval
+    
+    holding_details = []
+    for ticker, info in final_holdings.items():
+        t_short = TICKER_NAMES.get(ticker, ticker).split()[0]
+        holding_details.append(f"{t_short} {info['qty']}주({info['eval_amt']:,}원)")
         
-    msg = f"🔄 [{name}] 리밸런싱 완료\n- 목표 분할: {', '.join(status_summary)}\n"
-    if buy_results:
-        msg += "- 매수 결과:\n  " + "\n  ".join(buy_results)
-    else:
-        msg += "- 추가 매수 거래 없음 (목표 비중 충족)"
-        
-    print(msg)
+    msg_lines = [
+        f"✅ [{name}] 자산 리밸런싱 완료",
+        f"📊 계좌 자산: 총 {final_total_asset:,}원 (주식평가 {final_total_eval:,}원 | 예수금 {final_cash:,}원)",
+        f"📉 매도: {', '.join(sell_results) if sell_results else '없음 (보유 비중 유지)'}",
+        f"📈 매수: {', '.join(buy_results) if buy_results else '없음 (목표 비중 충족)'}",
+        f"📦 최종 보유: {', '.join(holding_details) if holding_details else '보유 주식 없음'}",
+        f"🏁 리밸런싱 정상 마감 완료!"
+    ]
+    msg = "\n".join(msg_lines)
+    print("\n" + msg)
     return msg
 
 def fetch_holiday_calendar_kis(base_date, token):

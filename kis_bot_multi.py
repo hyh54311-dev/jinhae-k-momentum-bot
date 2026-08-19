@@ -881,7 +881,6 @@ def main():
             print("⚠️ [스케줄 우회] 시뮬레이션/모의투자/강제실행 옵션으로 진행합니다.")
     start_time = datetime.datetime.now(kst_tz).strftime("%Y-%m-%d %H:%M:%S")
     mode_str = "Dry-run 시뮬레이션" if KIS_DRY_RUN else ("모의투자" if KIS_MOCK else "실전 자동 거래")
-    send_telegram(f"🤖 K-듀얼 모멘텀 통합 리밸런싱 로봇 가동 시작 ({mode_str})\n가동 시간: {start_time}")
     
     if not is_market_open():
         if not (KIS_DRY_RUN or KIS_MOCK):
@@ -899,7 +898,13 @@ def main():
         target_weights, reason = calculate_momentum_signals(token)
         
         weights_detail = [f"{TICKER_NAMES.get(t, t)} ({t}): {w*100:.0f}%" for t, w in target_weights.items()]
-        summary_msg = f"📈 금월 투자 대상 및 비중 선정:\n- 비중: {', '.join(weights_detail)}\n- 판단 근거: {reason}\n"
+        summary_msg = (
+            f"🤖 [K-듀얼 모멘텀] 리밸런싱 시작 ({mode_str})\n"
+            f"가동 시각: {start_time}\n\n"
+            f"📈 금월 투자 대상 및 비중 선정:\n"
+            f"• 비중: {', '.join(weights_detail)}\n"
+            f"• 판단 근거: {reason}"
+        )
         send_telegram(summary_msg)
         
         results = []
@@ -922,7 +927,7 @@ def main():
                 raise ae
                 
         if results:
-            send_telegram("📊 [작업 수행 리포트]\n" + "\n".join(results))
+            send_telegram("\n\n".join(results))
             
     except Exception as e:
         error_msg = f"🚨 로봇 구동 전역 에러 발생: {e}"

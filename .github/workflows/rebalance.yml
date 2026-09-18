@@ -2,14 +2,16 @@ name: K-Dual Momentum Quant Bot Auto Rebalance
 
 on:
   schedule:
-    # 매달 17일~31일 한국시간 12:30 (UTC 03:30) 무인 스케줄러 트리거
-    - cron: '30 3 17-31 * *'
+    # 1순위: Google Cloud Scheduler 웹훅 (workflow_dispatch)
+    # 2순위 백업: GitHub 무료 schedule 큐 (정각 회피: 7분, 지연 흡수 여유: 10:07, 13:07 KST)
+    - cron: '7 1 17-31 * *'    # UTC 01:07 = KST 10:07
+    - cron: '7 4 17-31 * *'    # UTC 04:07 = KST 13:07
   workflow_dispatch:
     inputs:
       dry_run:
-        description: 'Dry Run (실제 주문 없이 계산만 수행: true/false)'
+        description: 'Dry Run (신호만 계산하고 주문은 내지 않음: 1=on, 0=off)'
         required: false
-        default: 'false'
+        default: '0'
       force:
         description: 'Force Execution (가동일 체크 우회 강제 집행: true/false)'
         required: false
@@ -52,7 +54,8 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           KIS_MOCK: ${{ secrets.KIS_MOCK || 'False' }}
-          KIS_DRY_RUN: ${{ github.event.inputs.dry_run || secrets.KIS_DRY_RUN || 'False' }}
+          KIS_DRY_RUN: ${{ (github.event.inputs.dry_run == '1' || github.event.inputs.dry_run == 'true') && 'True' || secrets.KIS_DRY_RUN || 'False' }}
+          DRY_RUN: ${{ (github.event.inputs.dry_run == '1' || github.event.inputs.dry_run == 'true') && '1' || '0' }}
           MAX_ORDER_AMOUNT: ${{ secrets.MAX_ORDER_AMOUNT || '1000000000' }}
         run: |
           if [ "${{ github.event.inputs.force }}" = "true" ]; then

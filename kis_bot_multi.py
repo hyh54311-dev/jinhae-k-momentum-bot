@@ -66,6 +66,8 @@ MARGIN_POLL_TIMEOUT = 30.0    # 증거금 엔진 반영 최대 대기(초)
 TRADE_OPEN          = dt.time(9, 10)    # LP 호가 공백(09:00~09:05) 회피
 TRADE_DEADLINE      = dt.time(15, 15)   # 이 시각 이후 신규 주문 금지 (동시호가 회피)
 API_SLEEP           = 0.35    # KIS API 유량 제한 방어 (초당 20건 제한 준수)
+STALE_ORDER_MINUTES = 20      # 이 시간 이상 묵은 미체결은 취소 후 재집행
+DRY_RUN             = os.getenv("DRY_RUN", "0") == "1"   # 신호만 계산, 주문 금지
 
 _RUN_COMPLETED = False        # atexit 무음 실패 감지 플래그
 
@@ -83,7 +85,7 @@ TELEGRAM_CHAT_ID = ""
 
 def init_config():
     """실행 직전 최신 환경 변수를 로드하여 전역 변수에 바인딩"""
-    global KIS_MOCK, KIS_DRY_RUN, MAX_ORDER_AMOUNT, APP_KEY, APP_SECRET, URL_BASE, ACCOUNTS, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+    global KIS_MOCK, KIS_DRY_RUN, DRY_RUN, MAX_ORDER_AMOUNT, APP_KEY, APP_SECRET, URL_BASE, ACCOUNTS, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
     
     env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
     if os.path.exists(env_path):
@@ -93,6 +95,7 @@ def init_config():
 
     KIS_MOCK = os.getenv("KIS_MOCK", "False").lower() in ("true", "1", "yes")
     KIS_DRY_RUN = os.getenv("KIS_DRY_RUN", "False").lower() in ("true", "1", "yes")
+    DRY_RUN = os.getenv("DRY_RUN", "0") == "1" or KIS_DRY_RUN
     MAX_ORDER_AMOUNT = int(os.getenv("MAX_ORDER_AMOUNT", "1000000000"))
     TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -182,12 +185,14 @@ def send_telegram(msg: str) -> None:
         print(f"[TELEGRAM-DISABLED] {msg}")
         return
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg[:4000]},
-            timeout=10,
-            verify=False,
-        )
+        for i in range(0, len(msg), 3500):  # 4096자 제한 → 3500자 분할 전송
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": msg[i:i + 3500]},
+                timeout=10,
+                verify=False,
+            )
+            time.sleep(0.3)
     except Exception as e:
         print(f"⚠️ 텔레그램 전송 실패: {e}")
 
@@ -423,6 +428,10 @@ def wait_for_margin_sync(token, cano, prdt_cd, ticker, price, timeout=MARGIN_POL
           (15.4% 원천징수나 부분체결 발생 시에도 목표가 자동 보정되어 타임아웃 방지)
     [인터벌] 0.5s x 4회 ➔ 1.0s x 5회 ➔ 2.0s x N회
     """
+    # 15:15 데드라인까지 남은 시간이 폴링 예산보다 적으면 예산을 깎는다.
+    now = now_kst()
+    left = (dt.datetime.combine(now.date(), TRADE_DEADLINE, tzinfo=KST) - now).total_seconds()
+    timeout = max(5.0, min(timeout, left - 60))
     deadline = time.monotonic() + timeout
     delays, idx = [0.5] * 4 + [1.0] * 5 + [2.0] * 20, 0
     best_cap, last_ledger = 0, 0
@@ -500,16 +509,47 @@ def submit_buy_with_stepdown(token, cano, prdt_cd, ticker, qty, price, max_retry
     return False, 0, {"rt_cd": "9", "msg1": "재시도 소진"}
 
 
-def get_daily_orders(token, cano, prdt_cd, ccld_dvsn="00"):
-    """주식일별주문체결조회 (TTTC0081R / VTTC0081R) — ccld_dvsn: '00' 전체 / '01' 체결 / '02' 미체결"""
+def cancel_order(token, cano, prdt_cd, odno, qty, ord_gno_brno=""):
+    """
+    주식주문(정정취소) TTTC0803U / VTTC0803U — 미체결 잔량 전량 취소.
+    RVSE_CNCL_DVSN_CD: "01" 정정 / "02" 취소
+    """
+    url = f"{URL_BASE}/uapi/domestic-stock/v1/trading/order-rvsecncl"
+    is_mock = KIS_MOCK or "openapivts" in URL_BASE
+    tr_id = "VTTC0803U" if is_mock else "TTTC0803U"
+    body = {
+        "CANO": cano, "ACNT_PRDT_CD": prdt_cd,
+        "KRX_FWDG_ORD_ORGNO": str(ord_gno_brno or ""),
+        "ORGN_ODNO": str(odno),
+        "ORD_DVSN": "00",
+        "RVSE_CNCL_DVSN_CD": "02",
+        "ORD_QTY": str(int(qty)),
+        "ORD_UNPR": "0",
+        "QTY_ALL_ORD_YN": "Y",
+    }
+    try:
+        res = kis_api_request("POST", url, headers=kis_headers(token, tr_id), json=body, timeout=15)
+        time.sleep(API_SLEEP)
+        return res.json() if res.content else {"rt_cd": "9", "msg1": "빈 응답"}
+    except Exception as e:
+        return {"rt_cd": "9", "msg_cd": "NETERR", "msg1": f"취소 통신 오류: {e}"}
+
+
+def get_daily_orders(token, cano, prdt_cd, ccld_dvsn="00", start_dt=None, end_dt=None):
+    """
+    주식일별주문체결조회 (TTTC0081R / VTTC0081R) — 기본 당일분, 기간 지정 가능(3개월 이내).
+    ccld_dvsn: "00" 전체 / "01" 체결 / "02" 미체결
+    """
     url = f"{URL_BASE}/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
     is_mock = KIS_MOCK or "openapivts" in URL_BASE
     tr_id = "VTTC0081R" if is_mock else "TTTC0081R"
     today = now_kst().strftime("%Y%m%d")
+    start_dt = start_dt or today
+    end_dt = end_dt or today
 
     params = {
         "CANO": cano, "ACNT_PRDT_CD": prdt_cd,
-        "INQR_STRT_DT": today, "INQR_END_DT": today,
+        "INQR_STRT_DT": start_dt, "INQR_END_DT": end_dt,
         "SLL_BUY_DVSN_CD": "00", "INQR_DVSN": "00", "PDNO": "",
         "CCLD_DVSN": ccld_dvsn, "ORD_GNO_BRNO": "", "ODNO": "",
         "INQR_DVSN_3": "00", "INQR_DVSN_1": "",
@@ -562,24 +602,58 @@ def wait_for_fills(token, cano, prdt_cd, odno_list, timeout=FILL_POLL_TIMEOUT):
 # ──────────────────────────────────────────────────────────────────────────────
 def check_already_rebalanced_today(token, acc, target_weights, prices):
     """
-    (1) 미체결 잔량 존재 ➔ SKIP (중복 주문 방지)
-    (2) Drift <= 3%p AND 현금비중 <= 1.5% ➔ SKIP (이미 목표 도달)
-    (3) 그 외 ➔ 실행 (델타 기반이므로 미완료분 보정)
+    (1) 미체결 주문 처리: 묵은 주문(20분 초과)은 취소하고, 최근 주문(20분 이내)은 중복 방지 스킵
+    (2) 당월 체결 확인: 당월 리밸런싱 이미 완료(Drift <= 3%p AND 현금비중 <= 1.5%) 시 스킵
+    (3) 미완료 상태(현금비중 > 1.5% 등): 잔여분 보정 실행 (9/21 케이스)
     """
     cano, prdt_cd, name = acc["cano"], acc["prdt_cd"], acc["name"]
+    today = now_kst()
+    month_start = today.replace(day=1).strftime("%Y%m%d")
 
-    # (1) 미체결 주문 검증
+    # (1) 미체결 주문 처리 — 묵은 주문은 '차단'이 아니라 '취소 후 재집행'
     try:
         pending = get_daily_orders(token, cano, prdt_cd, ccld_dvsn="02")
-        remain = sum(to_int(r.get("rmn_qty")) for r in pending)
-        if remain > 0:
-            tickers = {r.get("pdno") for r in pending if to_int(r.get("rmn_qty")) > 0}
-            return True, f"[{name}] 미체결 잔량 {remain}주 존재({', '.join(sorted(tickers))}) — 중복 주문 방지 스킵"
+        live = [r for r in pending if to_int(r.get("rmn_qty")) > 0]
     except Exception as e:
-        print(f"⚠️ 미체결 조회 실패({e}) — 안전 스킵")
-        return True, f"[{name}] 미체결 조회 실패로 인한 안전 스킵"
+        print(f"⚠️ 미체결 조회 실패({e}) — 안전을 위해 스킵 판정")
+        return True, f"[{name}] 미체결 조회 불가 — 안전 스킵"
 
-    # (2) 포트폴리오 Drift 판정
+    if live:
+        def _age_min(row):
+            t = str(row.get("ord_tmd") or "000000").zfill(6)
+            try:
+                o = today.replace(hour=int(t[:2]), minute=int(t[2:4]), second=int(t[4:]))
+            except ValueError:
+                return 0.0
+            return max(0.0, (today - o).total_seconds() / 60.0)
+
+        fresh = [r for r in live if _age_min(r) < STALE_ORDER_MINUTES]
+        if fresh:
+            n = sum(to_int(r.get("rmn_qty")) for r in fresh)
+            return True, f"[{name}] 접수 {STALE_ORDER_MINUTES}분 이내 미체결 {n}주 존재 — 중복 주문 방지 스킵"
+
+        for r in live:
+            q = to_int(r.get("rmn_qty"))
+            cr = cancel_order(token, cano, prdt_cd, r.get("odno"), q, r.get("ord_gno_brno", ""))
+            ok = "OK" if cr.get("rt_cd") == "0" else f"실패({cr.get('msg1')})"
+            print(f"   🗑️ [묵은 미체결 취소] {r.get('pdno')} {q}주 → {ok}")
+        time.sleep(2)
+
+    # (2) 당월 집행 여부 + 현금비중 판정
+    #     ⭐ 당일이 아니라 '당월' 체결을 본다. 정기 리밸런싱은 월 1회이므로,
+    #        당월에 이미 집행이 끝났다면 월중 Drift가 벌어져도 재매매하지 않는다.
+    try:
+        month_rows = get_daily_orders(token, cano, prdt_cd, ccld_dvsn="01", start_dt=month_start)
+    except Exception as e:
+        print(f"⚠️ 당월 체결 조회 실패({e}) — 보수적으로 미집행 취급")
+        month_rows = []
+
+    universe_codes = set(target_weights) | set(TICKER_NAMES)
+    executed_this_month = any(
+        r.get("pdno") in universe_codes and to_int(r.get("tot_ccld_qty")) > 0
+        for r in month_rows
+    )
+
     ledger, _, holdings = get_account_balance(token, cano, prdt_cd)
     eval_sum = sum(h["eval_amt"] for h in holdings.values())
     total = ledger + eval_sum
@@ -588,20 +662,24 @@ def check_already_rebalanced_today(token, acc, target_weights, prices):
 
     cash_ratio = ledger / total
     max_drift, worst = 0.0, ""
-    universe = set(target_weights) | set(holdings)
-    for t in universe:
+    for t in (set(target_weights) | set(holdings)):
         cur_w = holdings.get(t, {}).get("eval_amt", 0) / total
-        tgt_w = target_weights.get(t, 0.0)
-        d = abs(cur_w - tgt_w)
+        d = abs(cur_w - target_weights.get(t, 0.0))
         if d > max_drift:
             max_drift, worst = d, t
 
-    print(f"   📐 [{name}] 최대 Drift {max_drift*100:.2f}%p ({TICKER_NAMES.get(worst, worst)}) | 현금비중 {cash_ratio*100:.2f}%")
+    print(f"   📐 [{name}] 당월집행={executed_this_month} | 최대 Drift {max_drift*100:.2f}%p "
+          f"({TICKER_NAMES.get(worst, worst)}) | 현금비중 {cash_ratio*100:.2f}%")
 
-    if max_drift <= DRIFT_TOLERANCE and cash_ratio <= CASH_TOLERANCE:
-        return True, f"[{name}] 이미 목표 상태 도달 (최대 Drift {max_drift*100:.2f}%p, 현금 {cash_ratio*100:.2f}%) — 스킵"
+    if executed_this_month:
+        if cash_ratio <= CASH_TOLERANCE and max_drift <= DRIFT_TOLERANCE:
+            return True, (f"[{name}] 당월 리밸런싱 집행 완료 "
+                          f"(현금 {cash_ratio*100:.2f}% ≤ {CASH_TOLERANCE*100:.1f}%, "
+                          f"Drift {max_drift*100:.2f}%p) — 스킵")
+        return False, (f"[{name}] 당월 집행은 있었으나 미완료 상태 "
+                       f"(현금 {cash_ratio*100:.2f}%, Drift {max_drift*100:.2f}%p) — 잔여분 보정 실행")
 
-    return False, f"[{name}] 미완료 상태 감지 (Drift {max_drift*100:.2f}%p, 현금 {cash_ratio*100:.2f}%) — 잔여분 보정 실행"
+    return False, f"[{name}] 당월 정기 리밸런싱 미집행 — 신규 집행"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -741,7 +819,7 @@ def rebalance_account(token, acc, target_weights, prices):
 
     # 5. 최종 검증 리포트
     time.sleep(3)
-    fin_ledger, fin_avail, fin_holdings = get_account_balance(token, cano, prdt_cd)
+    fin_ledger, _, fin_holdings = get_account_balance(token, cano, prdt_cd)
     fin_eval = sum(h["eval_amt"] for h in fin_holdings.values())
     fin_total = fin_ledger + fin_eval
     cash_pct = (fin_ledger / fin_total * 100) if fin_total else 0.0
@@ -772,7 +850,7 @@ def get_current_price(token, ticker):
     return None
 
 
-def get_monthly_closes_kis(token, ticker, count=14):
+def get_monthly_closes_kis(token, ticker, count=16):
     """KIS API 기간별시세(월봉, FHKST03010100)로 월별 종가 리스트 확보"""
     if not token:
         return None
@@ -799,8 +877,8 @@ def get_monthly_closes_kis(token, ticker, count=14):
                     if clpr:
                         prices.append(float(clpr))
                 prices.reverse()  # 과거 -> 최신순
-                if len(prices) >= 13:
-                    return prices[-13:]
+                if len(prices) >= 14:
+                    return prices[-14:]
     except Exception as e:
         print(f"⚠️ KIS 월봉 시세 조회 오류 ({ticker}): {e}")
     return None
@@ -822,8 +900,8 @@ def get_historical_prices_yahoo(symbol):
                 monthly_data[dt_str] = float(close)
         sorted_months = sorted(monthly_data.keys())
         prices = [monthly_data[m] for m in sorted_months]
-        if len(prices) >= 13:
-            return prices[-13:]
+        if len(prices) >= 14:
+            return prices[-14:]
     return None
 
 
@@ -858,8 +936,8 @@ def fetch_prices(token, tickers, holdings_hint=None):
 
 def calculate_momentum_signals(token):
     """
-    K-듀얼 모멘텀 핵심 알고리즘:
-      1. 4대 위험자산(KODEX 200, TIGER S&P500, ACE 금현물, ACE 미국30년국채)의 12개월 상대모멘텀 산출
+    K-듀얼 모멘텀 핵심 알고리즘 (전월말 확정 종가 기준):
+      1. 4대 위험자산의 12개월 상대모멘텀 산출 (당월 변동 제외, 전월말 종가 기준)
       2. 1위 자산 선정
       3. 1위 자산의 1, 3, 5개월 절대모멘텀 스코어(AMS, 0~3점) 산출
          - ams_score = score / 3.0
@@ -883,16 +961,19 @@ def calculate_momentum_signals(token):
             print(f"⚠️ {ticker} KIS 월봉 실패 ➔ Yahoo Finance 폴백")
             prices = get_historical_prices_yahoo(YAHOO_SYMBOLS.get(ticker, f"{ticker}.KS"))
             
-        if not prices or len(prices) < 13:
-            raise RuntimeError(f"🚨 모멘텀 데이터 부족: {ticker} (확보: {len(prices) if prices else 0}개)")
+        if not prices or len(prices) < 14:
+            raise RuntimeError(f"🚨 모멘텀 데이터 부족: {ticker} (확보: {len(prices) if prices else 0}개, 필요 14개)")
 
         prices_dict[ticker] = prices
-        base_p = prices[-13] if prices[-13] > 0 else 1.0
-        ret_12m = (prices[-1] - base_p) / base_p
+        # ⭐ 당월(진행 중) 월봉(prices[-1])은 매일 값이 변한다. prices[-1]을 쓰면 같은 달에
+        #    다시 실행할 때 신호가 뒤집혀 whipsaw(샀다 파는 왕복매매)가 난다.
+        #    전월 말 '확정' 종가(prices[-2]) 기준으로 계산해야 한 달 내내 동일한 목표가 나온다.
+        base_p = prices[-14] if prices[-14] > 0 else 1.0
+        ret_12m = (prices[-2] - base_p) / base_p
         returns_12m[ticker] = ret_12m
         time.sleep(0.3)
 
-    print("■ 12개월 상대 모멘텀 분석 결과:")
+    print("■ 12개월 상대 모멘텀 분석 결과 (전월말 확정 종가 기준):")
     for ticker, ret in returns_12m.items():
         print(f"    - {TICKER_NAMES.get(ticker, ticker)}: {ret*100:+.2f}%")
 
@@ -904,11 +985,11 @@ def calculate_momentum_signals(token):
 
     print(f">> 상대 모멘텀 1위 자산: {best_name} ({best_ticker}) (12M 수익률: {best_ret*100:+.2f}%)")
 
-    # 1위 자산의 1, 3, 5개월 AMS 산출
-    curr_p = best_prices[-1]
-    p_1m   = best_prices[-2]
-    p_3m   = best_prices[-4]
-    p_5m   = best_prices[-6]
+    # 1위 자산의 1, 3, 5개월 AMS 산출 (전월말 확정 종가 기준)
+    curr_p = best_prices[-2]   # 전월 말 확정 종가
+    p_1m   = best_prices[-3]   # 1개월 전 확정 종가
+    p_3m   = best_prices[-5]   # 3개월 전 확정 종가
+    p_5m   = best_prices[-7]   # 5개월 전 확정 종가
 
     score = 0
     if curr_p > p_1m: score += 1
@@ -943,8 +1024,20 @@ def main():
     if APP_KEY and APP_SECRET:
         token = get_access_token()
 
+    # ── DRY_RUN: 시간·휴장 게이트 이전에 '신호만' 계산해 보고하고 종료 ──
+    #    (장 시작 전이나 주말에 목표 비중을 미리 확인할 때 사용. 주문은 절대 안 나간다.)
+    if DRY_RUN or KIS_DRY_RUN:
+        tw, reason = calculate_momentum_signals(token)
+        px = fetch_prices(token, list(tw))
+        body = "\n".join(f"{TICKER_NAMES.get(t, t)}: {w*100:.1f}% @ {px.get(t, 0):,}원"
+                          for t, w in tw.items())
+        print("🧪 [DRY-RUN] 목표 비중:\n" + body)
+        send_telegram(f"🧪 [DRY-RUN] {now:%m/%d %H:%M} 목표 비중\n{body}\n(사유: {reason})")
+        _RUN_COMPLETED = True
+        return
+
     # 1. 휴장일 게이트 (모의/강제 실행 제외)
-    if not (KIS_DRY_RUN or KIS_MOCK or is_force):
+    if not (KIS_MOCK or is_force):
         if not is_market_open_today(token):
             msg = f"🗓️ {now:%Y-%m-%d}은 휴장일입니다. 실행하지 않고 정상 종료합니다."
             print(msg); send_telegram(msg); _RUN_COMPLETED = True; return

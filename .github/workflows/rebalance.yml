@@ -60,3 +60,11 @@ jobs:
           else
             python kis_bot_multi.py
           fi
+
+      - name: Alert Failure on Telegram
+        if: failure()
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d "text=🚨 [CRITICAL] GitHub Actions K-듀얼모멘텀 워크플로우 비정상 실패! 즉시 로그와 계좌를 확인하십시오. (Run ID: ${{ github.run_id }})"
+

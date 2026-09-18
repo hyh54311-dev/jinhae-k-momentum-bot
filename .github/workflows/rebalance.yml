@@ -3,9 +3,9 @@ name: K-Dual Momentum Quant Bot Auto Rebalance
 on:
   schedule:
     # 1순위: Google Cloud Scheduler 웹훅 (workflow_dispatch)
-    # 2순위 백업: GitHub 무료 schedule 큐 (정각 회피: 7분, 지연 흡수 여유: 10:07, 13:07 KST)
+    # 2순위 백업: GitHub 무료 schedule 큐 (정각 회피: 10:07, 11:47 KST — 13:30 Cloud Scheduler와 103분 여유 확보)
     - cron: '7 1 17-31 * *'    # UTC 01:07 = KST 10:07
-    - cron: '7 4 17-31 * *'    # UTC 04:07 = KST 13:07
+    - cron: '47 2 17-31 * *'   # UTC 02:47 = KST 11:47
   workflow_dispatch:
     inputs:
       dry_run:
@@ -13,9 +13,13 @@ on:
         required: false
         default: '0'
       force:
-        description: 'Force Execution (가동일 체크 우회 강제 집행: true/false)'
+        description: 'Force Execution (휴장일 체크만 우회. 거래시간 09:10~15:15은 우회 불가)'
         required: false
         default: 'false'
+
+# 최소 권한 부여 (Principle of Least Privilege)
+permissions:
+  contents: read
 
 # 동시 실행(중복 주문) 방지 락
 concurrency:

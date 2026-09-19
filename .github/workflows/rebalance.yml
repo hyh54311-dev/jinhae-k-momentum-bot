@@ -85,13 +85,18 @@ jobs:
           mkdir -p logs
           KST_TIME="$(TZ='Asia/Seoul' date +'%Y-%m-%d %H:%M:%S KST')"
           UTC_TIME="$(date -u +%FT%TZ)"
-          echo "${KST_TIME} (${UTC_TIME}) run=${{ github.run_id }} status=${{ job.status }}" >> "logs/$(date -u +%Y-%m).log"
+          echo "${KST_TIME} (${UTC_TIME}) run=${{ github.run_id }} status=${{ job.status }}" \
+            >> "logs/$(TZ='Asia/Seoul' date +%Y-%m).log"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add logs
           git commit -m "chore(log): $(TZ='Asia/Seoul' date +'%Y-%m-%d') KST 실행 기록 [skip ci]" || exit 0
           git pull --rebase --autostash || true
-          git push || echo "⚠️ 쓰기 권한이 없거나 푸시가 스킵되었습니다."
+          if ! git push; then
+            curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage" \
+              -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
+              -d "text=⚠️ [K-모멘텀] 실행 로그 커밋 실패 — 저장소 쓰기 권한을 확인하세요. Settings → Actions → General → Workflow permissions → 'Read and write permissions' 선택 후 저장. 이대로 두면 60일 후 예약 실행이 자동 정지됩니다."
+          fi
 
       - name: Alert Failure on Telegram
         if: failure()

@@ -729,7 +729,7 @@ def check_already_rebalanced_today(token, acc, target_weights, prices, read_only
     eval_sum = sum(h["eval_amt"] for h in holdings.values())
     total = ledger + eval_sum
     if total <= 0:
-        return True, f"[{name}] 총자산 0원 — 스킵", True
+        return True, f"[{name}] 총자산 0원 — 스킵 (잔고 조회 이상 여부 확인 필요)", False
 
     cash_ratio = ledger / total
     max_drift, worst = 0.0, ""

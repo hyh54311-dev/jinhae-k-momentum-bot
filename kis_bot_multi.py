@@ -902,6 +902,7 @@ def get_current_price(token, ticker):
 def get_monthly_closes_kis(token, ticker):
     """KIS API 기간별시세(월봉, FHKST03010100)로 월별 종가 리스트 확보"""
     if not token:
+        print(f"⚠️ [KIS 월봉] 토큰 없음 — KIS 경로를 건너뜁니다 ({ticker})")
         return None
     try:
         url = f"{URL_BASE}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"

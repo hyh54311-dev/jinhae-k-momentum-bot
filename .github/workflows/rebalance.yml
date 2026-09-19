@@ -8,6 +8,9 @@ on:
     - cron: '47 0 17-31 * *'    # 1발: UTC 00:47 = KST 09:47 (장 초반 급변동 파도 지난 시점)
     - cron: '17 2 17-31 * *'    # 2발: UTC 02:17 = KST 11:17 (점심 전 파도)
     - cron: '47 3 17-31 * *'    # 3발: UTC 03:47 = KST 12:47 (점심시간 파도)
+    # [4발: 월말 결산 생존 점검 (데드맨 스위치 & 침묵 감지 보증)]
+    # 매월 28~31일 14:00 KST에 실행되어 최종 영업일에 정확히 1회 생존 및 완료 보고서 발송
+    - cron: '0 5 28-31 * *'     # 4발: UTC 05:00 = KST 14:00 (월말 점검)
   workflow_dispatch:
     inputs:
       dry_run:
@@ -18,10 +21,14 @@ on:
         description: 'Force Execution (휴장일 체크만 우회. 거래시간 09:10~15:15은 우회 불가)'
         required: false
         default: 'false'
+      check_only:
+        description: 'Check Only (주문 없이 당월 완료 상태 점검 및 텔레그램 월말 1통 보고: true/false)'
+        required: false
+        default: 'false'
 
-# 최소 권한 부여 (Principle of Least Privilege)
+# 실행 로그 커밋을 통한 60일 비활성화 차단 (Write 권한 허용)
 permissions:
-  contents: read
+  contents: write
 
 # 동시 실행(중복 주문) 방지 락
 concurrency:
@@ -64,11 +71,25 @@ jobs:
           DRY_RUN: ${{ (github.event.inputs.dry_run == '1' || github.event.inputs.dry_run == 'true') && '1' || '0' }}
           MAX_ORDER_AMOUNT: ${{ secrets.MAX_ORDER_AMOUNT || '1000000000' }}
         run: |
-          if [ "${{ github.event.inputs.force }}" = "true" ]; then
+          if [ "${{ github.event.schedule }}" = "0 5 28-31 * *" ] || [ "${{ github.event.inputs.check_only }}" = "true" ]; then
+            python kis_bot_multi.py --check-only
+          elif [ "${{ github.event.inputs.force }}" = "true" ]; then
             python kis_bot_multi.py --force
           else
             python kis_bot_multi.py
           fi
+
+      - name: Commit Run Log (활동 유지 & 60일 비활성화 차단)
+        if: always()
+        run: |
+          mkdir -p logs
+          echo "$(date -u +%FT%TZ) run=${{ github.run_id }} status=${{ job.status }}" >> "logs/$(date -u +%Y-%m).log"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add logs
+          git commit -m "chore(log): $(date -u +%F) 실행 기록 [skip ci]" || exit 0
+          git pull --rebase --autostash || true
+          git push || echo "⚠️ 쓰기 권한이 없거나 푸시가 스킵되었습니다."
 
       - name: Alert Failure on Telegram
         if: failure()

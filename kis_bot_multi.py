@@ -205,21 +205,33 @@ def effective_drift_tolerance(total_asset: float, prices: dict) -> float:
     return max(DRIFT_TOLERANCE, (max_px / total_asset) * 1.5)
 
 
-def send_telegram(msg: str) -> None:
+def send_telegram(msg: str, raise_on_error: bool = False) -> bool:
     if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
         print(f"[TELEGRAM-DISABLED] {msg}")
-        return
+        if raise_on_error:
+            raise RuntimeError("텔레그램 토큰 또는 Chat ID가 설정되지 않았습니다.")
+        return False
     try:
+        success = True
         for i in range(0, len(msg), 3500):  # 4096자 제한 → 3500자 분할 전송
-            requests.post(
+            res = requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
                 json={"chat_id": TELEGRAM_CHAT_ID, "text": msg[i:i + 3500]},
                 timeout=10,
                 verify=VERIFY_SSL,
             )
+            if res.status_code != 200:
+                print(f"⚠️ 텔레그램 HTTP {res.status_code}: {res.text}")
+                success = False
+                if raise_on_error:
+                    res.raise_for_status()
             time.sleep(0.3)
+        return success
     except Exception as e:
         print(f"⚠️ 텔레그램 전송 실패: {e}")
+        if raise_on_error:
+            raise
+        return False
 
 
 @atexit.register
@@ -630,6 +642,21 @@ def wait_for_fills(token, cano, prdt_cd, odno_list, timeout=FILL_POLL_TIMEOUT):
     return False, total_amt
 
 
+def is_month_completed(cash_ratio: float) -> bool:
+    """
+    당월 리밸런싱 완료 판정 — 단일 기준(현금 소진: cash_ratio <= CASH_TOLERANCE 1.5%).
+    Drift는 로그·리포트용으로만 쓰며 완료 판정에는 결합하지 않는다.
+
+    근거:
+      · 현금이 남아 있으면 '더 살 수 있다'는 뜻이므로 실행해야 한다.
+      · 실행해도 살 게 없으면 목표수량 - 현재수량 = 0 이므로 주문이 나가지 않는다(무해).
+      · 즉 불필요한 실행은 무해하고, 불필요한 스킵은 유해하다 → 실행 쪽으로 기울인다.
+      · Drift를 완료 조건에 넣으면 '주식은 비율대로인데 현금만 남은' 상태가
+        완료로 오판되어 현금이 영구 방치된다(최대 10.76%, 단가 상승 시 확대).
+    """
+    return cash_ratio <= CASH_TOLERANCE
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 7. [Q2] 하이브리드 멱등성 가드 (델타 수렴 기반)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -639,7 +666,7 @@ def check_already_rebalanced_today(token, acc, target_weights, prices):
     (2) 당월 체결 확인:
         - 당일 집행 완료: 당일 3회 실행 확인을 위해 알림 허용 (prior_completed=False)
         - 이전 거래일 집행 완료: 익일부터 월말까지 완전 무소음 스킵 (prior_completed=True)
-    (3) 미완료 상태(현금비중 > 1.5% 및 Drift 초과): 잔여분 보정 실행 (9/21 케이스)
+    (3) 미완료 상태(현금비중 > 1.5%): 잔여분 보정 실행
     반환: (skip: bool, skip_reason: str, prior_completed: bool)
     """
     cano, prdt_cd, name = acc["cano"], acc["prdt_cd"], acc["name"]
@@ -715,10 +742,8 @@ def check_already_rebalanced_today(token, acc, target_weights, prices):
           f"({TICKER_NAMES.get(worst, worst)}) | 허용 Drift {eff_drift*100:.2f}%p | 현금비중 {cash_ratio*100:.2f}%")
 
     if executed_this_month:
-        # 리밸런싱 완료 조건: 현금 소진(<= CASH_TOLERANCE) 또는 비중 수렴(max_drift <= eff_drift)
-        is_completed = (cash_ratio <= CASH_TOLERANCE) or (max_drift <= eff_drift)
-
-        if is_completed:
+        # 리밸런싱 완료 조건: 현금 단독 소진 기준 (is_month_completed)
+        if is_month_completed(cash_ratio):
             if executed_today:
                 # 당일 집행된 경우: 사용자의 당일 3회 실행 확인을 위해 알림 허용 (prior_completed=False)
                 return True, (f"[{name}] 당일 리밸런싱 집행 완료 "
@@ -728,10 +753,11 @@ def check_already_rebalanced_today(token, acc, target_weights, prices):
                 return True, (f"[{name}] 이전 거래일에 당월 리밸런싱 집행 완료 "
                               f"(현금 {cash_ratio*100:.2f}%, Drift {max_drift*100:.2f}%p) — 익일 무소음 스킵"), True
 
-        # (c) 당월 집행은 있었으나 미완료 상태 (현금비중 > 1.5% 및 Drift 초과): 잔여분 보정 필요
-        return False, (f"[{name}] 당월 집행 있었으나 미완료 상태 "
-                       f"(현금 {cash_ratio*100:.2f}% > {CASH_TOLERANCE*100:.1f}%, "
-                       f"Drift {max_drift*100:.2f}%p > {eff_drift*100:.2f}%p) — 잔여분 보정 실행"), False
+        # (c) 당월 집행은 있었으나 현금 미소진 상태 (현금비중 > 1.5%): 잔여분 보정 필요
+        return False, (f"[{name}] 당월 집행 있었으나 현금 {cash_ratio*100:.2f}% 잔존 "
+                       f"(> {CASH_TOLERANCE*100:.1f}%, Drift {max_drift*100:.2f}%p) — 잔여분 보정 실행"), False
+
+    return False, f"[{name}] 당월 정기 리밸런싱 미집행 — 신규 집행", False
 
     return False, f"[{name}] 당월 정기 리밸런싱 미집행 — 신규 집행", False
 
@@ -1088,12 +1114,19 @@ def main():
     global _RUN_COMPLETED
     init_config()
     now = now_kst()
-    is_force = len(sys.argv) > 1 and sys.argv[1] == "--force"
+    is_force = len(sys.argv) > 1 and "--force" in sys.argv
+    is_check_only = len(sys.argv) > 1 and "--check-only" in sys.argv
     mode_str = "DRY-RUN 시뮬레이션" if KIS_DRY_RUN else ("모의투자" if KIS_MOCK else "실전 계좌")
 
     print(f"🚀 K-듀얼모멘텀 봇 기동 — {now:%Y-%m-%d %H:%M:%S} KST ({mode_str})")
     if not VERIFY_SSL:
         print("⚠️ [보안 경고] TLS 인증서 검증이 비활성화되어 있습니다 (KIS_VERIFY_SSL=0).")
+
+    # ── [안전 가드] --force 주말 실전 주문 차단 ──
+    if is_force and not (KIS_DRY_RUN or KIS_MOCK or DRY_RUN):
+        if now.weekday() >= 5:
+            print("⚠️ [--force] 주말(토/일)에는 KRX 증시가 폐장되어 실전 주문을 낼 수 없습니다. 시뮬레이션(DRY-RUN)으로 안전 강제 전환합니다.")
+            DRY_RUN = True
 
     token = None
     if APP_KEY and APP_SECRET:
@@ -1113,20 +1146,22 @@ def main():
 
     # 1. 주말(토/일) 무소음 가드
     #    토요일·일요일은 정규 증시 휴장일이므로, 텔레그램 발송 없이 조용히 정상 종료 (Silent Weekend)
-    if now.weekday() >= 5 and not is_force:
+    #    단, --check-only나 --force 수동 실행 시에는 내부 분기에서 자체 처리
+    if now.weekday() >= 5 and not (is_force or is_check_only):
         print(f"🗓️ {now:%Y-%m-%d}은 주말(토/일) 증시 휴장일입니다. 텔레그램 알림 없이 정상 종료합니다 (Silent Weekend).")
         _RUN_COMPLETED = True
         return
 
     # 2. 거래 허용 시간창 게이트 (09:10 ~ 15:15 KST)
     #    ⚠️ 최상위 강제 게이트: --force 플래그를 포함하여 어떤 경우에도 정규장 거래시간 밖에서는 실전 주문 불가!
-    if not (TRADE_OPEN <= now.time() <= TRADE_DEADLINE):
+    #    (단, 월말 점검 --check-only는 주문이 나가지 않으므로 14:00 정규 점검 실행)
+    if not (TRADE_OPEN <= now.time() <= TRADE_DEADLINE) and not is_check_only:
         msg = f"⏰ 현재 {now:%H:%M} KST는 정규장 거래창(09:10~15:15) 밖입니다. 슬리피지 방지를 위해 중단합니다."
         print(msg); send_telegram(f"🚨 [K-모멘텀] {msg}"); _RUN_COMPLETED = True; return
 
     # 3. 휴장일 게이트 (평일 법정공휴일 등)
     #    --force: 주말/공휴일 등 휴장일 체크만 우회 (휴장일 당일 시뮬레이션용). 거래시간 09:10~15:15은 우회 불가.
-    if not (KIS_MOCK or is_force):
+    if not (KIS_MOCK or is_force or is_check_only):
         if not is_market_open_today(token):
             # 이전 거래일에 이미 당월 리밸런싱이 완료된 상태라면 공휴일 알림도 생략하고 무소음 스킵
             already_done = False
@@ -1140,8 +1175,8 @@ def main():
                     executed = any(to_int(r.get("tot_ccld_qty")) > 0 for r in rows)
                     ledger, _, holdings = get_account_balance(token, acc["cano"], acc["prdt_cd"])
                     tot = ledger + sum(h["eval_amt"] for h in holdings.values())
-                    c_ratio = (ledger / tot) if tot > 0 else 0
-                    checks.append(executed and c_ratio <= CASH_TOLERANCE)
+                    c_ratio = (ledger / tot) if tot > 0 else 0.0
+                    checks.append(executed and is_month_completed(c_ratio))
                 already_done = len(checks) > 0 and all(checks)
             except Exception:
                 already_done = False
@@ -1159,6 +1194,42 @@ def main():
     prices = fetch_prices(token, list(target_weights))
     print(f"🎯 목표 비중: " + ", ".join(f"{TICKER_NAMES.get(t, t)} {w*100:.1f}%" for t, w in target_weights.items()))
     print(f"   (판단 근거: {reason})")
+
+    # ── [월말 점검 모드 (--check-only)] ──
+    # 매월 말 1회 생존 및 완료 점검 (데드맨 스위치 & 침묵 감지 보증)
+    if is_check_only:
+        import calendar
+        is_manual = is_force or any("check_only" in arg for arg in sys.argv)
+        if now.weekday() >= 5 and not is_manual:
+            print(f"🗓️ {now:%Y-%m-%d}은 주말이므로 월말 점검 리포트를 발송하지 않고 평일까지 대기합니다.")
+            _RUN_COMPLETED = True
+            return
+
+        # 당월 남은 평일 중 오늘이 마지막 영업일인지 확인 (월말 정확히 1통 보장)
+        _, last_day = calendar.monthrange(now.year, now.month)
+        has_future_weekday = any(
+            dt.date(now.year, now.month, d).weekday() < 5
+            for d in range(now.day + 1, last_day + 1)
+        )
+        if has_future_weekday and not is_manual:
+            print(f"ℹ️ 이번 달 남은 평일이 존재합니다 (오늘: {now.day}일 / 말일: {last_day}일). 최종 영업일에 1통 발송합니다.")
+            _RUN_COMPLETED = True
+            return
+
+        print(f"📅 [월말 결산 점검] {now:%Y-%m-%d %H:%M} KST — 전 계좌 생존 및 완료 상태 종합 검증")
+        lines = []
+        for acc in ACCOUNTS:
+            if not acc.get("cano"): continue
+            skip, s_reason, _ = check_already_rebalanced_today(token, acc, target_weights, prices)
+            tag = "✅" if skip else "🚨"
+            lines.append(f"{tag} {acc['name']}: {s_reason}")
+
+        report = f"📅 [K-모멘텀] {now:%Y년 %m월} 월말 결산 생존 점검\n" + "\n".join(lines)
+        print(report)
+        # 월말 점검은 텔레그램 실패 시 예외를 발생시켜 GitHub Action 실패 ➔ 소유자 이메일 알림 보장
+        send_telegram(report, raise_on_error=True)
+        _RUN_COMPLETED = True
+        return
 
     # 5. 전 계좌 사전 멱등성 검사 (당일 3회 알림 허용 / 익일 이후 기완료 시 무소음 스킵)
     account_checks = []

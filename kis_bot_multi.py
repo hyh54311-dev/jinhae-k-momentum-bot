@@ -636,8 +636,11 @@ def wait_for_fills(token, cano, prdt_cd, odno_list, timeout=FILL_POLL_TIMEOUT):
 def check_already_rebalanced_today(token, acc, target_weights, prices):
     """
     (1) 미체결 주문 처리: 묵은 주문(30분 초과)은 취소하고, 최근 주문(30분 이내)은 중복 방지 스킵
-    (2) 당월 체결 확인: 당월 리밸런싱 이미 완료(현금비중 <= 1.5% 또는 Drift <= 동적허용치) 시 스킵
+    (2) 당월 체결 확인:
+        - 당일 집행 완료: 당일 3회 실행 확인을 위해 알림 허용 (prior_completed=False)
+        - 이전 거래일 집행 완료: 익일부터 월말까지 완전 무소음 스킵 (prior_completed=True)
     (3) 미완료 상태(현금비중 > 1.5% 및 Drift 초과): 잔여분 보정 실행 (9/21 케이스)
+    반환: (skip: bool, skip_reason: str, prior_completed: bool)
     """
     cano, prdt_cd, name = acc["cano"], acc["prdt_cd"], acc["name"]
     today = now_kst()
@@ -649,7 +652,7 @@ def check_already_rebalanced_today(token, acc, target_weights, prices):
         live = [r for r in pending if to_int(r.get("rmn_qty")) > 0]
     except Exception as e:
         print(f"⚠️ 미체결 조회 실패({e}) — 안전을 위해 스킵 판정")
-        return True, f"[{name}] 미체결 조회 불가 — 안전 스킵"
+        return True, f"[{name}] 미체결 조회 불가 — 안전 스킵", False
 
     if live:
         def _age_min(row):
@@ -663,7 +666,7 @@ def check_already_rebalanced_today(token, acc, target_weights, prices):
         fresh = [r for r in live if _age_min(r) < STALE_ORDER_MINUTES]
         if fresh:
             n = sum(to_int(r.get("rmn_qty")) for r in fresh)
-            return True, f"[{name}] 접수 {STALE_ORDER_MINUTES}분 이내 미체결 {n}주 존재 — 중복 주문 방지 스킵"
+            return True, f"[{name}] 접수 {STALE_ORDER_MINUTES}분 이내 미체결 {n}주 존재 — 중복 주문 방지 스킵", False
 
         for r in live:
             q = to_int(r.get("rmn_qty"))
@@ -682,16 +685,22 @@ def check_already_rebalanced_today(token, acc, target_weights, prices):
         month_rows = []
 
     universe_codes = set(target_weights) | set(TICKER_NAMES)
-    executed_this_month = any(
-        r.get("pdno") in universe_codes and to_int(r.get("tot_ccld_qty")) > 0
-        for r in month_rows
+    executed_rows = [
+        r for r in month_rows
+        if r.get("pdno") in universe_codes and to_int(r.get("tot_ccld_qty")) > 0
+    ]
+    executed_this_month = bool(executed_rows)
+    today_str = today.strftime("%Y%m%d")
+    executed_today = any(
+        str(r.get("ord_dt") or r.get("ord_date") or "").strip() == today_str
+        for r in executed_rows
     )
 
     ledger, _, holdings = get_account_balance(token, cano, prdt_cd)
     eval_sum = sum(h["eval_amt"] for h in holdings.values())
     total = ledger + eval_sum
     if total <= 0:
-        return True, f"[{name}] 총자산 0원 — 스킵"
+        return True, f"[{name}] 총자산 0원 — 스킵", True
 
     cash_ratio = ledger / total
     max_drift, worst = 0.0, ""
@@ -702,25 +711,29 @@ def check_already_rebalanced_today(token, acc, target_weights, prices):
             max_drift, worst = d, t
 
     eff_drift = effective_drift_tolerance(total, prices)
-    print(f"   📐 [{name}] 당월집행={executed_this_month} | 최대 Drift {max_drift*100:.2f}%p "
+    print(f"   📐 [{name}] 당월집행={executed_this_month}(당일={executed_today}) | 최대 Drift {max_drift*100:.2f}%p "
           f"({TICKER_NAMES.get(worst, worst)}) | 허용 Drift {eff_drift*100:.2f}%p | 현금비중 {cash_ratio*100:.2f}%")
 
     if executed_this_month:
-        # (a) 현금이 이미 1.5% 이하로 소진된 경우: 추가 매수 재원이 없으므로 Drift가 남아도 완료 스킵
-        if cash_ratio <= CASH_TOLERANCE:
-            return True, (f"[{name}] 당월 리밸런싱 집행 완료 "
-                          f"(현금 {cash_ratio*100:.2f}% ≤ {CASH_TOLERANCE*100:.1f}% 소진 완료, "
-                          f"Drift {max_drift*100:.2f}%p) — 스킵")
-        # (b) Drift가 허용 오차 이내인 경우: 완료 스킵
-        if max_drift <= eff_drift:
-            return True, (f"[{name}] 당월 리밸런싱 집행 완료 "
-                          f"(Drift {max_drift*100:.2f}%p ≤ {eff_drift*100:.2f}%p, "
-                          f"현금 {cash_ratio*100:.2f}%) — 스킵")
-        # (c) 현금도 남아있고(> 1.5%) Drift도 허용치 초과: 잔여분 보정 실행 (9/21 케이스)
-        return False, (f"[{name}] 당월 집행은 있었으나 미완료 상태 "
-                       f"(현금 {cash_ratio*100:.2f}% > {CASH_TOLERANCE*100:.1f}%, Drift {max_drift*100:.2f}%p > {eff_drift*100:.2f}%p) — 잔여분 보정 실행")
+        # 리밸런싱 완료 조건: 현금 소진(<= CASH_TOLERANCE) 또는 비중 수렴(max_drift <= eff_drift)
+        is_completed = (cash_ratio <= CASH_TOLERANCE) or (max_drift <= eff_drift)
 
-    return False, f"[{name}] 당월 정기 리밸런싱 미집행 — 신규 집행"
+        if is_completed:
+            if executed_today:
+                # 당일 집행된 경우: 사용자의 당일 3회 실행 확인을 위해 알림 허용 (prior_completed=False)
+                return True, (f"[{name}] 당일 리밸런싱 집행 완료 "
+                              f"(현금 {cash_ratio*100:.2f}% ≤ {CASH_TOLERANCE*100:.1f}%, Drift {max_drift*100:.2f}%p) — 당일 확인 스킵"), False
+            else:
+                # 이전 거래일에 이미 완료된 경우: 익일부터는 텔레그램 미발송 (prior_completed=True)
+                return True, (f"[{name}] 이전 거래일에 당월 리밸런싱 집행 완료 "
+                              f"(현금 {cash_ratio*100:.2f}%, Drift {max_drift*100:.2f}%p) — 익일 무소음 스킵"), True
+
+        # (c) 당월 집행은 있었으나 미완료 상태 (현금비중 > 1.5% 및 Drift 초과): 잔여분 보정 필요
+        return False, (f"[{name}] 당월 집행 있었으나 미완료 상태 "
+                       f"(현금 {cash_ratio*100:.2f}% > {CASH_TOLERANCE*100:.1f}%, "
+                       f"Drift {max_drift*100:.2f}%p > {eff_drift*100:.2f}%p) — 잔여분 보정 실행"), False
+
+    return False, f"[{name}] 당월 정기 리밸런싱 미집행 — 신규 집행", False
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1098,45 +1111,112 @@ def main():
         _RUN_COMPLETED = True
         return
 
-    # 1. 거래 허용 시간창 게이트 (09:10 ~ 15:15 KST)
+    # 1. 주말(토/일) 무소음 가드
+    #    토요일·일요일은 정규 증시 휴장일이므로, 텔레그램 발송 없이 조용히 정상 종료 (Silent Weekend)
+    if now.weekday() >= 5 and not is_force:
+        print(f"🗓️ {now:%Y-%m-%d}은 주말(토/일) 증시 휴장일입니다. 텔레그램 알림 없이 정상 종료합니다 (Silent Weekend).")
+        _RUN_COMPLETED = True
+        return
+
+    # 2. 거래 허용 시간창 게이트 (09:10 ~ 15:15 KST)
     #    ⚠️ 최상위 강제 게이트: --force 플래그를 포함하여 어떤 경우에도 정규장 거래시간 밖에서는 실전 주문 불가!
     if not (TRADE_OPEN <= now.time() <= TRADE_DEADLINE):
         msg = f"⏰ 현재 {now:%H:%M} KST는 정규장 거래창(09:10~15:15) 밖입니다. 슬리피지 방지를 위해 중단합니다."
         print(msg); send_telegram(f"🚨 [K-모멘텀] {msg}"); _RUN_COMPLETED = True; return
 
-    # 2. 휴장일 게이트 (모의/강제 실행 제외)
+    # 3. 휴장일 게이트 (평일 법정공휴일 등)
     #    --force: 주말/공휴일 등 휴장일 체크만 우회 (휴장일 당일 시뮬레이션용). 거래시간 09:10~15:15은 우회 불가.
     if not (KIS_MOCK or is_force):
         if not is_market_open_today(token):
-            msg = f"🗓️ {now:%Y-%m-%d}은 휴장일입니다. 실행하지 않고 정상 종료합니다."
+            # 이전 거래일에 이미 당월 리밸런싱이 완료된 상태라면 공휴일 알림도 생략하고 무소음 스킵
+            already_done = False
+            try:
+                today_dt = now_kst()
+                month_start = today_dt.replace(day=1).strftime("%Y%m%d")
+                checks = []
+                for acc in ACCOUNTS:
+                    if not acc.get("cano"): continue
+                    rows = get_daily_orders(token, acc["cano"], acc["prdt_cd"], ccld_dvsn="01", start_dt=month_start)
+                    executed = any(to_int(r.get("tot_ccld_qty")) > 0 for r in rows)
+                    ledger, _, holdings = get_account_balance(token, acc["cano"], acc["prdt_cd"])
+                    tot = ledger + sum(h["eval_amt"] for h in holdings.values())
+                    c_ratio = (ledger / tot) if tot > 0 else 0
+                    checks.append(executed and c_ratio <= CASH_TOLERANCE)
+                already_done = len(checks) > 0 and all(checks)
+            except Exception:
+                already_done = False
+
+            if already_done:
+                print(f"🗓️ {now:%Y-%m-%d}은 증시 휴장일이며, 이전 거래일에 이미 당월 리밸런싱이 완료되었습니다. 무소음 정상 종료합니다.")
+                _RUN_COMPLETED = True
+                return
+
+            msg = f"🗓️ {now:%Y-%m-%d}은 증시 휴장일입니다. 실행하지 않고 정상 종료합니다."
             print(msg); send_telegram(msg); _RUN_COMPLETED = True; return
 
-    send_telegram(f"🔔 [K-모멘텀] {now:%m/%d %H:%M} 리밸런싱 세션 시작 ({mode_str})")
-
-    # 3. 모멘텀 신호 산출 및 가격 수집
+    # 4. 모멘텀 신호 산출 및 가격 수집
     target_weights, reason = calculate_momentum_signals(token)
     prices = fetch_prices(token, list(target_weights))
     print(f"🎯 목표 비중: " + ", ".join(f"{TICKER_NAMES.get(t, t)} {w*100:.1f}%" for t, w in target_weights.items()))
     print(f"   (판단 근거: {reason})")
 
-    # 4. 다중 계좌 순회 집행 (계좌 완전 격리)
-    results = []
-    for i, acc in enumerate(ACCOUNTS):
+    # 5. 전 계좌 사전 멱등성 검사 (당일 3회 알림 허용 / 익일 이후 기완료 시 무소음 스킵)
+    account_checks = []
+    for acc in ACCOUNTS:
         if not acc.get("cano"):
             continue
+        try:
+            skip, skip_reason, prior_completed = check_already_rebalanced_today(token, acc, target_weights, prices)
+            account_checks.append({
+                "acc": acc,
+                "skip": skip,
+                "skip_reason": skip_reason,
+                "prior_completed": prior_completed,
+            })
+        except Exception as ce:
+            print(f"⚠️ [{acc.get('name')}] 사전 상태 검증 예외({ce}) — 일반 집행 루프로 이관")
+            account_checks.append({
+                "acc": acc,
+                "skip": False,
+                "skip_reason": f"상태 검증 예외: {ce}",
+                "prior_completed": False,
+            })
+
+    # 모든 유효 계좌가 이전 거래일에 이미 리밸런싱을 완료한 경우: 무소음 스킵 (Silent Skip)
+    all_prior_completed = (
+        len(account_checks) > 0 and
+        all(chk["prior_completed"] for chk in account_checks)
+    )
+
+    if all_prior_completed:
+        print("\n" + "=" * 62)
+        print("🧭 [무소음 스킵 (Silent Skip)] 전 계좌가 이미 이전 거래일에 당월 리밸런싱을 성공적으로 완료하였습니다.")
+        for chk in account_checks:
+            print(f"   - {chk['skip_reason']}")
+        print("   ➔ 텔레그램 발송을 생략하고 세션을 조용히 정상 종료합니다.")
+        print("=" * 62)
+        _RUN_COMPLETED = True
+        return
+
+    # 당일 신규 집행이 필요하거나, 당일 집행 완료 후 2·3회차 확인 알림인 경우 텔레그램 세션 시작 발송
+    send_telegram(f"🔔 [K-모멘텀] {now:%m/%d %H:%M} 리밸런싱 세션 시작 ({mode_str})")
+
+    # 6. 다중 계좌 순회 집행 (계좌 완전 격리)
+    results = []
+    for i, chk in enumerate(account_checks):
+        acc = chk["acc"]
         if i > 0:
             print(">> 계좌 간 유량제한 여유 대기 (5초)...")
             time.sleep(5)
 
         try:
-            # 멱등성 검증
-            skip, skip_reason = check_already_rebalanced_today(token, acc, target_weights, prices)
-            print(f"🧭 {skip_reason}")
-            if skip:
-                results.append(f"⏭️ {skip_reason}")
+            # 사전에 스킵으로 판정된 경우 (당일 2·3회차 확인 스킵 또는 특정 계좌 기완료)
+            if chk["skip"]:
+                print(f"🧭 {chk['skip_reason']}")
+                results.append(f"⏭️ {chk['skip_reason']}")
                 continue
 
-            # 리밸런싱 집행
+            # 실제 리밸런싱 주문 집행
             report = rebalance_account(token, acc, target_weights, prices)
             results.append(report)
 

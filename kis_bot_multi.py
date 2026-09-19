@@ -611,12 +611,13 @@ def wait_for_fills(token, cano, prdt_cd, odno_list, timeout=FILL_POLL_TIMEOUT):
     if KIS_DRY_RUN:
         return True, 0
 
+    target_odnos = {str(o).strip().lstrip("0") for o in odno_list if o}
     deadline = time.monotonic() + timeout
     total_amt = 0
     print(f"⏳ [체결 확인] 주문 {len(odno_list)}건 잔량 소진 대기 (최대 {timeout:.0f}초)...")
     while time.monotonic() < deadline:
         rows = get_daily_orders(token, cano, prdt_cd, ccld_dvsn="00")
-        mine = [r for r in rows if r.get("odno") in odno_list]
+        mine = [r for r in rows if str(r.get("odno", "")).strip().lstrip("0") in target_odnos]
         if mine:
             remain = sum(to_int(r.get("rmn_qty")) for r in mine)
             total_amt = sum(to_int(r.get("tot_ccld_amt")) for r in mine)
@@ -634,9 +635,9 @@ def wait_for_fills(token, cano, prdt_cd, odno_list, timeout=FILL_POLL_TIMEOUT):
 # ──────────────────────────────────────────────────────────────────────────────
 def check_already_rebalanced_today(token, acc, target_weights, prices):
     """
-    (1) 미체결 주문 처리: 묵은 주문(20분 초과)은 취소하고, 최근 주문(20분 이내)은 중복 방지 스킵
-    (2) 당월 체결 확인: 당월 리밸런싱 이미 완료(Drift <= 3%p AND 현금비중 <= 1.5%) 시 스킵
-    (3) 미완료 상태(현금비중 > 1.5% 등): 잔여분 보정 실행 (9/21 케이스)
+    (1) 미체결 주문 처리: 묵은 주문(30분 초과)은 취소하고, 최근 주문(30분 이내)은 중복 방지 스킵
+    (2) 당월 체결 확인: 당월 리밸런싱 이미 완료(현금비중 <= 1.5% 또는 Drift <= 동적허용치) 시 스킵
+    (3) 미완료 상태(현금비중 > 1.5% 및 Drift 초과): 잔여분 보정 실행 (9/21 케이스)
     """
     cano, prdt_cd, name = acc["cano"], acc["prdt_cd"], acc["name"]
     today = now_kst()
@@ -705,12 +706,19 @@ def check_already_rebalanced_today(token, acc, target_weights, prices):
           f"({TICKER_NAMES.get(worst, worst)}) | 허용 Drift {eff_drift*100:.2f}%p | 현금비중 {cash_ratio*100:.2f}%")
 
     if executed_this_month:
-        if cash_ratio <= CASH_TOLERANCE and max_drift <= eff_drift:
+        # (a) 현금이 이미 1.5% 이하로 소진된 경우: 추가 매수 재원이 없으므로 Drift가 남아도 완료 스킵
+        if cash_ratio <= CASH_TOLERANCE:
             return True, (f"[{name}] 당월 리밸런싱 집행 완료 "
-                          f"(현금 {cash_ratio*100:.2f}% ≤ {CASH_TOLERANCE*100:.1f}%, "
-                          f"Drift {max_drift*100:.2f}%p ≤ {eff_drift*100:.2f}%p) — 스킵")
+                          f"(현금 {cash_ratio*100:.2f}% ≤ {CASH_TOLERANCE*100:.1f}% 소진 완료, "
+                          f"Drift {max_drift*100:.2f}%p) — 스킵")
+        # (b) Drift가 허용 오차 이내인 경우: 완료 스킵
+        if max_drift <= eff_drift:
+            return True, (f"[{name}] 당월 리밸런싱 집행 완료 "
+                          f"(Drift {max_drift*100:.2f}%p ≤ {eff_drift*100:.2f}%p, "
+                          f"현금 {cash_ratio*100:.2f}%) — 스킵")
+        # (c) 현금도 남아있고(> 1.5%) Drift도 허용치 초과: 잔여분 보정 실행 (9/21 케이스)
         return False, (f"[{name}] 당월 집행은 있었으나 미완료 상태 "
-                       f"(현금 {cash_ratio*100:.2f}%, Drift {max_drift*100:.2f}%p > {eff_drift*100:.2f}%p) — 잔여분 보정 실행")
+                       f"(현금 {cash_ratio*100:.2f}% > {CASH_TOLERANCE*100:.1f}%, Drift {max_drift*100:.2f}%p > {eff_drift*100:.2f}%p) — 잔여분 보정 실행")
 
     return False, f"[{name}] 당월 정기 리밸런싱 미집행 — 신규 집행"
 

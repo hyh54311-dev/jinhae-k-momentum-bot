@@ -83,11 +83,13 @@ jobs:
         if: always()
         run: |
           mkdir -p logs
-          echo "$(date -u +%FT%TZ) run=${{ github.run_id }} status=${{ job.status }}" >> "logs/$(date -u +%Y-%m).log"
+          KST_TIME="$(TZ='Asia/Seoul' date +'%Y-%m-%d %H:%M:%S KST')"
+          UTC_TIME="$(date -u +%FT%TZ)"
+          echo "${KST_TIME} (${UTC_TIME}) run=${{ github.run_id }} status=${{ job.status }}" >> "logs/$(date -u +%Y-%m).log"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add logs
-          git commit -m "chore(log): $(date -u +%F) 실행 기록 [skip ci]" || exit 0
+          git commit -m "chore(log): $(TZ='Asia/Seoul' date +'%Y-%m-%d') KST 실행 기록 [skip ci]" || exit 0
           git pull --rebase --autostash || true
           git push || echo "⚠️ 쓰기 권한이 없거나 푸시가 스킵되었습니다."
 

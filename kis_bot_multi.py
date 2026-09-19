@@ -1158,7 +1158,7 @@ def main():
             if not acc.get("cano"):
                 continue
             skip, s_reason, _ = check_already_rebalanced_today(token, acc, target_weights, prices, read_only=True)
-            tag = "✅" if skip else "🚨"
+            tag = "✅" if (skip and "완료" in s_reason) else "🚨"
             lines.append(f"{tag} {acc['name']}: {s_reason}")
 
         report = f"📅 [K-모멘텀] {now:%Y년 %m월} 월말 결산 생존 점검 ({now.day}일)\n" + "\n".join(lines)

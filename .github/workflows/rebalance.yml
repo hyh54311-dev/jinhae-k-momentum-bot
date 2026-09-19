@@ -2,10 +2,12 @@ name: K-Dual Momentum Quant Bot Auto Rebalance
 
 on:
   schedule:
-    # 1순위: Google Cloud Scheduler 웹훅 (workflow_dispatch)
-    # 2순위 백업: GitHub 무료 schedule 큐 (정각 회피: 10:07, 11:47 KST — 13:30 Cloud Scheduler와 103분 여유 확보)
-    - cron: '7 1 17-31 * *'    # UTC 01:07 = KST 10:07
-    - cron: '47 2 17-31 * *'   # UTC 02:47 = KST 11:47
+    # [3발 분산 크론: 혼잡 파도 비껴가기 & 신용카드 0원 무인화]
+    # 매월 17~31일 하루 3번 번호표를 뽑아 혼잡을 비껴가는 3중 안전망 (월 최대 45회 기회 확보)
+    # 1발이 체결되면 봇 내장 '델타 수렴 멱등성 가드(현금 <= 1.5%)'가 2·3발을 0.1초 만에 자동 스킵
+    - cron: '47 0 17-31 * *'    # 1발: UTC 00:47 = KST 09:47 (장 초반 급변동 파도 지난 시점)
+    - cron: '17 2 17-31 * *'    # 2발: UTC 02:17 = KST 11:17 (점심 전 파도)
+    - cron: '47 3 17-31 * *'    # 3발: UTC 03:47 = KST 12:47 (점심시간 파도)
   workflow_dispatch:
     inputs:
       dry_run:

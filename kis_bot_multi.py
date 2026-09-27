@@ -697,7 +697,7 @@ def check_already_rebalanced_today(token, acc, target_weights, prices, read_only
             return True, f"[{name}] 접수 {STALE_ORDER_MINUTES}분 이내 미체결 {n}주 존재 — 중복 주문 방지 스킵", False
 
         if read_only:
-            return True, f"[{name}] 묵은 미체결 {len(live)}건 존재 (취소는 집행 단계에서 수행)", False
+            return False, f"[{name}] 묵은 미체결 {len(live)}건 — 집행 단계에서 취소 후 재집행", False
 
         for r in live:
             q = to_int(r.get("rmn_qty"))
@@ -1316,8 +1316,12 @@ def main():
                 results.append(f"⏭️ {chk['skip_reason']}")
                 continue
 
-            # 게이트 통과 후 실제 주문 전 묵은 미체결 주문 취소 실행 (행동은 게이트 뒤에서 수행)
-            check_already_rebalanced_today(token, acc, target_weights, prices, read_only=False)
+            # 게이트 통과 후 실제 주문 전 묵은 미체결 주문 취소 실행 (행동은 게이트 뒤에서 수행) 및 재판정
+            skip2, reason2, _ = check_already_rebalanced_today(token, acc, target_weights, prices, read_only=False)
+            if skip2:
+                print(f"🧭 {reason2}")
+                results.append(f"⏭️ {reason2}")
+                continue
 
             # 실제 리밸런싱 주문 집행
             report = rebalance_account(token, acc, target_weights, prices)

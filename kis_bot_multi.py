@@ -674,35 +674,37 @@ def check_already_rebalanced_today(token, acc, target_weights, prices, read_only
     today = now_kst()
     month_start = today.replace(day=1).strftime("%Y%m%d")
 
-    # (1) 미체결 주문 처리 — 묵은 주문은 '차단'이 아니라 '취소 후 재집행' (read_only 시 취소 건너뜀)
-    if not read_only:
-        try:
-            pending = get_daily_orders(token, cano, prdt_cd, ccld_dvsn="02")
-            live = [r for r in pending if to_int(r.get("rmn_qty")) > 0]
-        except Exception as e:
-            print(f"⚠️ 미체결 조회 실패({e}) — 안전을 위해 스킵 판정")
-            return True, f"[{name}] 미체결 조회 불가 — 안전 스킵", False
+    # (1) 미체결 주문 처리 (판정은 read_only 관계없이 항상 조회, 취소 행동만 read_only=False일 때)
+    try:
+        pending = get_daily_orders(token, cano, prdt_cd, ccld_dvsn="02")
+        live = [r for r in pending if to_int(r.get("rmn_qty")) > 0]
+    except Exception as e:
+        print(f"⚠️ 미체결 조회 실패({e}) — 안전을 위해 스킵 판정")
+        return True, f"[{name}] 미체결 조회 불가 — 안전 스킵", False
 
-        if live:
-            def _age_min(row):
-                t = str(row.get("ord_tmd") or "000000").zfill(6)
-                try:
-                    o = today.replace(hour=int(t[:2]), minute=int(t[2:4]), second=int(t[4:]))
-                except ValueError:
-                    return 0.0
-                return max(0.0, (today - o).total_seconds() / 60.0)
+    if live:
+        def _age_min(row):
+            t = str(row.get("ord_tmd") or "000000").zfill(6)
+            try:
+                o = today.replace(hour=int(t[:2]), minute=int(t[2:4]), second=int(t[4:]))
+            except ValueError:
+                return 0.0
+            return max(0.0, (today - o).total_seconds() / 60.0)
 
-            fresh = [r for r in live if _age_min(r) < STALE_ORDER_MINUTES]
-            if fresh:
-                n = sum(to_int(r.get("rmn_qty")) for r in fresh)
-                return True, f"[{name}] 접수 {STALE_ORDER_MINUTES}분 이내 미체결 {n}주 존재 — 중복 주문 방지 스킵", False
+        fresh = [r for r in live if _age_min(r) < STALE_ORDER_MINUTES]
+        if fresh:
+            n = sum(to_int(r.get("rmn_qty")) for r in fresh)
+            return True, f"[{name}] 접수 {STALE_ORDER_MINUTES}분 이내 미체결 {n}주 존재 — 중복 주문 방지 스킵", False
 
-            for r in live:
-                q = to_int(r.get("rmn_qty"))
-                cr = cancel_order(token, cano, prdt_cd, r.get("odno"), q, r.get("ord_gno_brno", ""))
-                ok = "OK" if cr.get("rt_cd") == "0" else f"실패({cr.get('msg1')})"
-                print(f"   🗑️ [묵은 미체결 취소] {r.get('pdno')} {q}주 → {ok}")
-            time.sleep(2)
+        if read_only:
+            return True, f"[{name}] 묵은 미체결 {len(live)}건 존재 (취소는 집행 단계에서 수행)", False
+
+        for r in live:
+            q = to_int(r.get("rmn_qty"))
+            cr = cancel_order(token, cano, prdt_cd, r.get("odno"), q, r.get("ord_gno_brno", ""))
+            ok = "OK" if cr.get("rt_cd") == "0" else f"실패({cr.get('msg1')})"
+            print(f"   🗑️ [묵은 미체결 취소] {r.get('pdno')} {q}주 → {ok}")
+        time.sleep(2)
 
     # (2) 당월 집행 여부 + 현금비중 판정
     #     ⭐ 당일이 아니라 '당월' 체결을 본다. 정기 리밸런싱은 월 1회이므로,
@@ -732,11 +734,12 @@ def check_already_rebalanced_today(token, acc, target_weights, prices, read_only
         return True, f"[{name}] 총자산 0원 — 스킵 (잔고 조회 이상 여부 확인 필요)", False
 
     # ── [소액 매수불가 자산 조기 완료 판정] ──
-    # 유니버스 내 최소 1주 가격보다 총자산이 적으면 어떤 주식도 매수할 수 없으므로 당월 소진 완료로 판정
-    min_share_price = min(prices.values()) if prices else 15000
-    if total < min_share_price:
+    # 유니버스 내 최소 1주 가격보다 총자산이 적고 보유 주식이 전혀 없으면 매수 불가 소액 계좌
+    _valid_px = [p for p in prices.values() if p and p > 0]
+    min_share_price = min(_valid_px) if _valid_px else None
+    if min_share_price and total < min_share_price and not holdings:
         return True, (f"[{name}] 총자산 {total:,}원 < 최소 1주 단가({min_share_price:,}원) "
-                      f"— 매수 불가 소액 자산 (당월 완료 스킵)"), True
+                      f"— 매수 불가 소액 계좌 (입금 시 자동 집행)"), True
 
     cash_ratio = ledger / total
     max_drift, worst = 0.0, ""
@@ -752,7 +755,7 @@ def check_already_rebalanced_today(token, acc, target_weights, prices, read_only
 
     if executed_this_month:
         # 리밸런싱 완료 조건: 현금 단독 소진 기준 (is_month_completed) 또는 잔여 현금이 1주 단가 미만
-        is_done = is_month_completed(cash_ratio) or (ledger < min_share_price)
+        is_done = is_month_completed(cash_ratio) or (min_share_price is not None and ledger < min_share_price)
         if is_done:
             if executed_today:
                 # 당일 집행된 경우: 사용자의 당일 3회 실행 확인을 위해 알림 허용 (prior_completed=False)
@@ -1146,10 +1149,10 @@ def main():
         token = get_access_token()
 
     # ── [월말 점검 모드 (--check-only)] ──
-    # 매월 28~31일 결산 생존 및 완료 점검 (데드맨 스위치 & 침묵 감지 보증)
+    # 매월 25~31일 결산 생존 및 완료 점검 (데드맨 스위치 & 침묵 감지 보증)
     # 신호 계산이나 거래창 게이트 실패에 죽지 않도록 최상단에서 독립 실행
     if is_check_only:
-        is_manual_check = is_force or any("check_only" in arg for arg in sys.argv)
+        is_manual_check = is_manual
         if now.weekday() >= 5 and not is_manual_check:
             print(f"🗓️ {now:%Y-%m-%d}은 주말이므로 월말 점검 리포트를 발송하지 않고 평일까지 대기합니다.")
             _RUN_COMPLETED = True
@@ -1171,7 +1174,7 @@ def main():
             if not acc.get("cano"):
                 continue
             skip, s_reason, _ = check_already_rebalanced_today(token, acc, target_weights, prices, read_only=True)
-            tag = "✅" if (skip and "완료" in s_reason) else "🚨"
+            tag = "ℹ️" if "소액 계좌" in s_reason else ("✅" if (skip and "완료" in s_reason) else "🚨")
             lines.append(f"{tag} {acc['name']}: {s_reason}")
 
         report = f"📅 [K-모멘텀] {now:%Y년 %m월} 월말 결산 생존 점검 ({now.day}일)\n" + "\n".join(lines)
@@ -1203,25 +1206,25 @@ def main():
 
     # 2. 모멘텀 신호 산출 및 가격 수집
     #    (사전 멱등성 및 당월 완료 검사를 위해 신호와 최소 단가를 먼저 파악)
+    signal_failed, signal_err = False, ""
     try:
         target_weights, reason = calculate_momentum_signals(token)
         prices = fetch_prices(token, list(target_weights))
     except Exception as se:
-        print(f"⚠️ 신호/시세 조회 예외({se}) — 안전자산 100% fallback")
-        target_weights = {TICKER_SAFE: 1.0}
-        prices = {}
-        reason = f"신호 조회 예외 fallback: {se}"
+        signal_failed, signal_err = True, str(se)
+        target_weights, prices, reason = {}, {}, f"신호 산출 실패: {se}"
+        print(f"⚠️ 신호/시세 조회 예외({se}) — 사전 검사만 수행하고 집행은 보류합니다")
 
-    print(f"🎯 목표 비중: " + ", ".join(f"{TICKER_NAMES.get(t, t)} {w*100:.1f}%" for t, w in target_weights.items()))
+    print(f"🎯 목표 비중: " + (", ".join(f"{TICKER_NAMES.get(t, t)} {w*100:.1f}%" for t, w in target_weights.items()) if target_weights else "없음 (신호 실패)"))
     print(f"   (판단 근거: {reason})")
 
-    # 3. 전 계좌 사전 멱등성 검사 (당일 3회 알림 허용 / 익일 이후 기완료 시 무소음 스킵)
+    # 3. 전 계좌 사전 멱등성 검사 (read_only=True로 순수 판정만 수행, 취소는 게이트 통과 후 수행)
     account_checks = []
     for acc in ACCOUNTS:
         if not acc.get("cano"):
             continue
         try:
-            skip, skip_reason, prior_completed = check_already_rebalanced_today(token, acc, target_weights, prices)
+            skip, skip_reason, prior_completed = check_already_rebalanced_today(token, acc, target_weights, prices, read_only=True)
             account_checks.append({
                 "acc": acc,
                 "skip": skip,
@@ -1254,6 +1257,12 @@ def main():
         _RUN_COMPLETED = True
         return
 
+    # 미완료 상태인데 신호 산출에 실패한 경우: 안전자산 100% 등으로 오인 매매하지 않고 집행 보류 및 경보 발송
+    if signal_failed:
+        send_telegram(f"🚨 [K-모멘텀] 신호 산출 실패 — 오늘 집행을 보류합니다. 다음 발사에서 재시도합니다.\n({signal_err})")
+        _RUN_COMPLETED = True
+        return
+
     # 4. 휴장일 게이트 (평일 법정공휴일 등)
     #    미완료 계좌가 있으나 오늘이 공휴일인 경우:
     #    정규장 거래시간 내(또는 수동 실행)에만 1회 안내 발송, 정규장 마감 후 지연 크론은 무소음 종료
@@ -1271,14 +1280,21 @@ def main():
     # 5. 거래 허용 시간창 게이트 (09:10 ~ 15:15 KST)
     #    ⚠️ 최상위 안전 게이트: 정규장 거래시간 밖에서는 어떤 경우에도 실전 주문 불가!
     #    - 수동 실행(workflow_dispatch 또는 --force): 사용자에게 시간 경보 발송
-    #    - 자동 스케줄러(cron) 지연 실행: 텔레그램 소음 없이 조용히 정상 종료
+    #    - 자동 스케줄러(cron) 지연 실행:
+    #      (a) 당일 집행 완료 확인 샷: 무소음 종료 (9/22~25 소음 원천 차단)
+    #      (b) 진짜 미완료 계좌 잔존: 알림 발송 (체결 전까지 매일 알림 요구 100% 보장)
+    needs_work = [c["acc"]["name"] for c in account_checks if not c["skip"]]
+
     if not (TRADE_OPEN <= now.time() <= TRADE_DEADLINE):
         msg = f"⏰ 현재 {now:%H:%M} KST는 정규장 거래창(09:10~15:15) 밖입니다. 슬리피지 방지를 위해 중단합니다."
         print(msg)
         if is_manual:
             send_telegram(f"🚨 [K-모멘텀] {msg}")
+        elif needs_work:
+            send_telegram(f"⏰ [K-모멘텀] 거래창 밖 기동({now:%H:%M}) — 미완료 계좌 "
+                          f"{', '.join(needs_work)}는 오늘 집행하지 못했습니다. 다음 영업일 09:47에 재시도합니다.")
         else:
-            print("   (자동 스케줄러 지연 실행에 따른 정규장 종료이므로 텔레그램 알림 없이 조용히 종료합니다.)")
+            print("   (당일 집행 완료 후 지연 도착한 확인 샷 — 무소음 종료)")
         _RUN_COMPLETED = True
         return
 
@@ -1299,6 +1315,9 @@ def main():
                 print(f"🧭 {chk['skip_reason']}")
                 results.append(f"⏭️ {chk['skip_reason']}")
                 continue
+
+            # 게이트 통과 후 실제 주문 전 묵은 미체결 주문 취소 실행 (행동은 게이트 뒤에서 수행)
+            check_already_rebalanced_today(token, acc, target_weights, prices, read_only=False)
 
             # 실제 리밸런싱 주문 집행
             report = rebalance_account(token, acc, target_weights, prices)

@@ -70,6 +70,7 @@ jobs:
           KIS_DRY_RUN: ${{ (github.event.inputs.dry_run == '1' || github.event.inputs.dry_run == 'true') && 'True' || secrets.KIS_DRY_RUN || 'False' }}
           DRY_RUN: ${{ (github.event.inputs.dry_run == '1' || github.event.inputs.dry_run == 'true') && '1' || '0' }}
           MAX_ORDER_AMOUNT: ${{ secrets.MAX_ORDER_AMOUNT || '1000000000' }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
         run: |
           if [ "${{ github.event.schedule }}" = "0 5 28-31 * *" ] || [ "${{ github.event.inputs.check_only }}" = "true" ]; then
             python kis_bot_multi.py --check-only

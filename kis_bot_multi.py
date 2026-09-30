@@ -321,6 +321,29 @@ def is_market_open_today(token: str) -> bool:
     return now_kst().weekday() < 5
 
 
+def get_last_business_day_of_month(year: int, month: int) -> dt.date:
+    """
+    당월의 마지막 영업일(주말 및 KRX 연말 휴장일 제외)을 반환합니다.
+    - 토/일요일 및 매년 12월 31일(연말 납회일/증시 휴장일)을 안전하게 제외하여,
+      월말 결산 생존 점검 보고서가 매월 마지막 날 1회만 정밀 발송되도록 보장합니다.
+    """
+    krx_year_end_holidays = {"2026-12-31", "2027-12-31", "2028-12-31", "2029-12-31", "2030-12-31"}
+    if month == 12:
+        next_month = dt.date(year + 1, 1, 1)
+    else:
+        next_month = dt.date(year, month + 1, 1)
+    last_d = next_month - dt.timedelta(days=1)
+
+    while True:
+        if last_d.weekday() >= 5:
+            last_d -= dt.timedelta(days=1)
+            continue
+        if last_d.strftime("%Y-%m-%d") in krx_year_end_holidays:
+            last_d -= dt.timedelta(days=1)
+            continue
+        return last_d
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 3. [Q3-1] get_orderable_cash — 매수 가용현금 정밀 산출 (우선순위 채택)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1131,7 +1154,9 @@ def main():
     now = now_kst()
     is_force = len(sys.argv) > 1 and "--force" in sys.argv
     is_check_only = len(sys.argv) > 1 and "--check-only" in sys.argv
-    is_manual = is_force or any(k in sys.argv for k in ["--force", "--check-only"]) or os.getenv("GITHUB_EVENT_NAME") == "workflow_dispatch"
+    event_name = os.getenv("GITHUB_EVENT_NAME", "")
+    is_scheduled = (event_name == "schedule")
+    is_manual = is_force or (event_name == "workflow_dispatch") or (not event_name and any(k in sys.argv for k in ["--force", "--check-only"]))
     mode_str = "DRY-RUN 시뮬레이션" if KIS_DRY_RUN else ("모의투자" if KIS_MOCK else "실전 계좌")
 
     print(f"🚀 K-듀얼모멘텀 봇 기동 — {now:%Y-%m-%d %H:%M:%S} KST ({mode_str})")
@@ -1150,15 +1175,26 @@ def main():
 
     # ── [월말 점검 모드 (--check-only)] ──
     # 매월 25~31일 결산 생존 및 완료 점검 (데드맨 스위치 & 침묵 감지 보증)
+    # 매월 마지막 영업일에 1회 정밀 발송 (월말 1회 발송 원칙)
     # 신호 계산이나 거래창 게이트 실패에 죽지 않도록 최상단에서 독립 실행
     if is_check_only:
-        is_manual_check = is_manual
-        if now.weekday() >= 5 and not is_manual_check:
+        # workflow_dispatch(수동 트리거)이거나 로컬 수동 테스트인 경우 날짜 게이트 우회
+        is_manual_check = (event_name == "workflow_dispatch") or (not event_name and is_manual)
+        last_bday = get_last_business_day_of_month(now.year, now.month)
+
+        if now.weekday() >= 5 and not is_force:
             print(f"🗓️ {now:%Y-%m-%d}은 주말이므로 월말 점검 리포트를 발송하지 않고 평일까지 대기합니다.")
             _RUN_COMPLETED = True
             return
 
-        print(f"📅 [월말 결산 점검] {now:%Y-%m-%d %H:%M} KST — 전 계좌 생존 및 완료 상태 종합 검증")
+        if not is_manual_check:
+            # 당월 마지막 영업일이 아니면 무소음 대기 (매월 마지막 날 1회 발송 원칙)
+            if now.date() != last_bday:
+                print(f"ℹ️ [월말 점검 대기] 오늘({now:%Y-%m-%d})은 당월 마지막 영업일({last_bday:%Y-%m-%d})이 아닙니다. 말일에 1회 발송합니다.")
+                _RUN_COMPLETED = True
+                return
+
+        print(f"📅 [월말 결산 점검] {now:%Y-%m-%d %H:%M} KST — 전 계좌 생존 및 완료 상태 종합 검증 (당월 마지막 영업일: {last_bday})")
 
         # 신호 계산 실패가 생존 보고를 차단하지 않도록 격리 (실패 시에도 현금비중 단독 점검)
         try:

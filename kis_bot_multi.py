@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 kis_bot_multi.py — K-듀얼모멘텀 다중계좌 무인 리밸런싱 봇
-Production Hardened Build : rev.4.4 2026-10-20 (Claude Opus 5 & Argon 36-Scenario 무인 운용 최종 확정본)
+Production Hardened Build : rev.4.4 / rev.4.5 2026-10-27 (Claude Opus 5.5 & Argon 36-Scenario 무인 운용 최종 확정본)
 
 [핵심 설계 원칙 (Institutional Architecture)]
   P1. 원장(ledger)과 주문한도(orderable)를 절대 하나의 변수로 합치지 않는다.
@@ -91,11 +91,13 @@ URL_BASE = ""
 ACCOUNTS = []
 TELEGRAM_TOKEN = ""
 TELEGRAM_CHAT_ID = ""
+_last_holdings_cache = {}
 
 
 def init_config():
     """실행 직전 최신 환경 변수를 로드하여 전역 변수에 바인딩"""
     global KIS_MOCK, KIS_DRY_RUN, DRY_RUN, MAX_ORDER_AMOUNT, APP_KEY, APP_SECRET, URL_BASE, ACCOUNTS, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, VERIFY_SSL
+    _last_holdings_cache.clear()
     
     env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
     if os.path.exists(env_path):
@@ -247,7 +249,7 @@ def compute_target_quantities(total_asset: int, target_weights: dict, prices: di
         px = prices.get(t, 0)
         if not px or px <= 0:
             return {}
-        q = int((total_asset * w) // px)
+        q = int(round(total_asset * w, 2) // px)
         qtys[t] = q
         spent += q * buy_limit_price(px)
 
@@ -262,7 +264,7 @@ def compute_target_quantities(total_asset: int, target_weights: dict, prices: di
             lim_px = buy_limit_price(prices[t])
             if lim_px > residual:
                 continue
-            shortfall = total_asset * w - qtys.get(t, 0) * lim_px
+            shortfall = round(total_asset * w, 2) - qtys.get(t, 0) * lim_px
             cands.append((shortfall, t, lim_px))
         if not cands:
             break
@@ -298,7 +300,7 @@ def _already_matches_target_quantities(
             continue
         cur_q = h.get("qty", 0)
         px = prices.get(t, 0)
-        base_q = int((total_asset * target_weights.get(t, 0.0)) // px) if px > 0 else 0
+        base_q = int(round(total_asset * target_weights.get(t, 0.0), 2) // px) if px > 0 else 0
         allowed_max = max(base_q, tq.get(t, 0))
         if cur_q > allowed_max:
             return False
@@ -314,7 +316,7 @@ def _already_matches_target_quantities(
         px = prices.get(t, 0)
         if px <= 0:
             return False
-        base_q = int((total_asset * w) // px)
+        base_q = int(round(total_asset * w, 2) // px)
         cur_q = holdings.get(t, {}).get("qty", 0)
         # 현금이 min_buy 미만이어서 1주도 더 살 수 없는 상태라면 1주 차이(시세 변동)는 허용
         min_acceptable = max(0, base_q - 1) if ledger < min_buy else base_q
@@ -322,6 +324,32 @@ def _already_matches_target_quantities(
             return False
 
     return True
+
+
+def has_log_marker(ym_str: str, marker: str) -> bool:
+    """당월 로그 파일(logs/YYYY-MM.log)에 지정된 마커 문자열이 존재하는지 확인"""
+    log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", f"{ym_str}.log")
+    if not os.path.exists(log_path):
+        return False
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+            return marker in f.read()
+    except Exception:
+        return False
+
+
+def write_log_marker(ym_str: str, marker: str):
+    """당월 로그 파일(logs/YYYY-MM.log)에 지정된 마커를 중복 없이 기록"""
+    if has_log_marker(ym_str, marker):
+        return
+    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, f"{ym_str}.log")
+    try:
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"{now_kst():%Y-%m-%d %H:%M:%S KST} {marker}\n")
+    except Exception as e:
+        print(f"⚠️ 로그 마커({marker}) 기록 실패: {e}")
 
 
 def has_sent_monthly_check_report(ym_str: str) -> bool:
@@ -346,6 +374,19 @@ def mark_monthly_check_report_sent(ym_str: str):
             f.write(f"{now_kst():%Y-%m-%d %H:%M:%S KST} check_report=sent\n")
     except Exception as e:
         print(f"⚠️ 월말 점검 마커 기록 실패: {e}")
+
+
+def _is_completed_status(skip: bool, reason: str) -> bool:
+    """
+    [M-4 & L-2] 계좌 상태가 '정상 완료(또는 매수불가 소액)'인지 엄격 판정.
+    API 조회 실패로 인한 안전 스킵('미체결 조회 불가', '당월 체결 조회 불가', '취소 실패', '중복 주문 방지')은
+    skip=True이더라도 절대 완료(True)로 간주하지 않아 장 마감 후 누락 경보가 침묵하는 현상을 차단합니다.
+    """
+    if not skip or not reason:
+        return False
+    if any(bad in reason for bad in ("미완료", "조회 불가", "취소 실패", "중복 주문 방지", "중복 방지", "총자산 0원", "예외")):
+        return False
+    return ("완료" in reason) or ("일치" in reason) or ("소액 계좌" in reason)
 
 
 def send_telegram(msg: str, raise_on_error: bool = False) -> bool:
@@ -642,6 +683,8 @@ def get_account_balance(token, cano, prdt_cd, ticker_for_quote="069500", quote_p
         orderable_cash = int(ledger_cash * BUY_BUFFER)
         print(f"   ⚠️ [TTTC8908R 폴백] 매수가능조회 실패로 원장 예수금 버퍼({orderable_cash:,}원)를 임시 상한으로 사용합니다.")
 
+    if holdings:
+        _last_holdings_cache.update(holdings)
     print(f"   📒 원장 예수금 {ledger_cash:,}원 ({ledger_src}) | 🏦 즉시주문한도 {orderable_cash:,}원")
     return ledger_cash, orderable_cash, holdings
 
@@ -887,7 +930,8 @@ def check_already_rebalanced_today(token, acc, target_weights, prices, read_only
     """
     cano, prdt_cd, name = acc["cano"], acc["prdt_cd"], acc["name"]
     today = now_kst()
-    month_start = today.replace(day=1).strftime("%Y%m%d")
+    rebalance_start_day = 17 if today.day >= 17 else 1
+    month_start = today.replace(day=rebalance_start_day).strftime("%Y%m%d")
 
     # (1) 미체결 주문 처리 (판정은 read_only 관계없이 항상 조회, 취소 행동만 read_only=False일 때)
     try:
@@ -979,6 +1023,15 @@ def check_already_rebalanced_today(token, acc, target_weights, prices, read_only
                           f"현금 {cash_ratio*100:.2f}%, Drift {max_drift*100:.2f}%p)"), True
 
     if executed_this_month:
+        if target_weights:
+            unliquidated = [
+                TICKER_NAMES.get(t, t)
+                for t, h in holdings.items()
+                if t in TICKER_NAMES and h.get("qty", 0) > 0 and target_weights.get(t, 0.0) <= 0
+            ]
+            if unliquidated:
+                return False, (f"[{name}] 당월 체결 이력 있으나 비목표 종목({', '.join(unliquidated)}) "
+                               f"미매도 잔량 보유 — 잔여 매도 및 보정 실행"), False
         if is_done:
             if executed_today:
                 # 당일 집행된 경우: 사용자의 당일 3회 실행 확인을 위해 알림 허용 (prior_completed=False)
@@ -999,7 +1052,7 @@ def check_already_rebalanced_today(token, acc, target_weights, prices, read_only
 # ──────────────────────────────────────────────────────────────────────────────
 # 8. [Q3-3] rebalance_account — 집행 엔진 (그리디 소진 패스 포함)
 # ──────────────────────────────────────────────────────────────────────────────
-def rebalance_account(token, acc, target_weights, prices):
+def rebalance_account(token, acc, target_weights, prices, enforce_deadline: bool = False):
     name, cano, prdt_cd = acc["name"], acc["cano"], acc["prdt_cd"]
     print("\n" + "=" * 62)
     print(f"🔄 [{name}] 자산 리밸런싱 시작 ({cano}-{prdt_cd})")
@@ -1029,8 +1082,16 @@ def rebalance_account(token, acc, target_weights, prices):
     target_qtys = compute_target_quantities(total_asset, target_weights, prices)
 
     # 1. 초과 비중 매도 (최유리지정가 '03'으로 상한가 증거금 왜곡 차단)
+    if enforce_deadline:
+        cur_t = now_kst().time()
+        if not (TRADE_OPEN <= cur_t <= TRADE_DEADLINE):
+            msg = f"⏰ [{name}] 매도 직전 정규장 마감 임박({cur_t:%H:%M:%S} > {TRADE_DEADLINE:%H:%M}) 감지 — 동시호가 슬리피지 방지를 위해 집행을 중단합니다."
+            print(msg)
+            return msg
+
     pre_sell_ledger = ledger_cash
     sell_odnos, sell_results, sold_any = [], [], False
+    est_total_sell_amt = 0
     for ticker, info in holdings.items():
         if ticker not in TICKER_NAMES:
             continue
@@ -1059,6 +1120,7 @@ def rebalance_account(token, acc, target_weights, prices):
             if odno: sell_odnos.append(odno)
             sell_results.append(f"매도: {t_name} {sell_qty}주")
             sold_any = True
+            est_total_sell_amt += int(est_sell_amt)
         else:
             warn = f"❌ 매도 실패 {t_name}: {res.get('msg1')}"
             print(f"   {warn}")
@@ -1069,6 +1131,8 @@ def rebalance_account(token, acc, target_weights, prices):
     # 2. 체결 확인 ➔ 미체결 매도 잔량 취소(S28) ➔ 증거금 엔진 적응형 폴링 동기화
     if sold_any:
         filled, ccld_amt = wait_for_fills(token, cano, prdt_cd, sell_odnos)
+        canceled_qty = 0
+        cancel_verify_ok = True
         if not filled:
             try:
                 target_set = {str(o).strip().lstrip("0") for o in sell_odnos if o}
@@ -1077,7 +1141,11 @@ def rebalance_account(token, acc, target_weights, prices):
                     if str(pr.get("odno", "")).strip().lstrip("0") in target_set:
                         rmn = to_int(pr.get("rmn_qty"))
                         if rmn > 0:
-                            cancel_order(token, cano, prdt_cd, pr.get("odno"), rmn, pr.get("ord_gno_brno", ""))
+                            cr = cancel_order(token, cano, prdt_cd, pr.get("odno"), rmn, pr.get("ord_gno_brno", ""))
+                            if isinstance(cr, dict) and cr.get("rt_cd") != "0":
+                                cancel_verify_ok = False
+                            else:
+                                canceled_qty += rmn
                 time.sleep(2.0)
                 after_rows = get_daily_orders(token, cano, prdt_cd, ccld_dvsn="00")
                 ccld_amt = sum(
@@ -1086,12 +1154,17 @@ def rebalance_account(token, acc, target_weights, prices):
                     if str(r.get("odno", "")).strip().lstrip("0") in target_set
                 )
             except Exception as ce:
+                cancel_verify_ok = False
                 print(f"⚠️ 미체결 매도 잔량 취소/재조회 중 예외: {ce}")
-            send_telegram(f"⚠️ [{name}] 매도 미체결 잔량 취소 완료. 확인된 체결금 {ccld_amt:,}원 기준으로 진행합니다.")
+            if canceled_qty > 0 or not cancel_verify_ok or ccld_amt < int(est_total_sell_amt * 0.5):
+                send_telegram(f"⚠️ [{name}] 매도 미체결 잔량 취소 완료. 확인된 체결금 {ccld_amt:,}원 기준으로 진행합니다.")
+            else:
+                print(f"ℹ️ [{name}] 취소 대상 미체결 잔량 없음(전량 기체결 확인: {ccld_amt:,}원) — 불필요 취소 경보 생략")
 
+        effective_ccld_amt = ccld_amt if ccld_amt > 0 else (est_total_sell_amt if (cancel_verify_ok and canceled_qty == 0) else 0)
         orderable_cash, ledger_cash, _ = wait_for_margin_sync(
             token, cano, prdt_cd, quote_t, quote_px,
-            pre_ledger=pre_sell_ledger, ccld_amt=ccld_amt,
+            pre_ledger=pre_sell_ledger, ccld_amt=effective_ccld_amt,
         )
         _, _, holdings = get_account_balance(
             token, cano, prdt_cd, ticker_for_quote=quote_t, quote_price=quote_px
@@ -1141,7 +1214,7 @@ def rebalance_account(token, acc, target_weights, prices):
                 continue
             planned = next((b["qty"] for b in buys if b["ticker"] == t), 0)
             have = holdings.get(t, {}).get("qty", 0)
-            shortfall = total_asset * w - (have + planned) * px
+            shortfall = round(total_asset * w, 2) - (have + planned) * px
             cands.append((shortfall, t, px))
         if not cands:
             break
@@ -1158,6 +1231,16 @@ def rebalance_account(token, acc, target_weights, prices):
         print(f"   ♻️ [잔여현금 소진] {added}주 추가 배정, 최종 잔여 {residual:,}원 ({residual / total_asset * 100:.2f}%)")
 
     # 4. 매수 집행 (동적 현금 캡 + IGW00014 5% 축소 자가치유 + 매수 ODNO 수집)
+    if enforce_deadline and buys:
+        cur_t = now_kst().time()
+        if not (TRADE_OPEN <= cur_t <= TRADE_DEADLINE):
+            msg = f"⏰ [{name}] 매도 정산 후 정규장 마감({cur_t:%H:%M:%S} > {TRADE_DEADLINE:%H:%M}) 도달 — 매수 주문은 다음 영업일 장중에 안전하게 재개합니다."
+            print(msg)
+            lines = [f"⏸️ [{name}] 매도 완료 후 장 마감 임박으로 매수 이월"]
+            lines += sell_results
+            lines.append(msg)
+            return "\n".join(lines)
+
     buy_results = []
     buy_odnos = []
     avail = max_buy_fund
@@ -1231,37 +1314,40 @@ def get_current_price(token, ticker):
 
 
 def get_monthly_closes_kis(token, ticker):
-    """KIS API 기간별시세(월봉, FHKST03010100)로 월별 종가 리스트 확보"""
+    """KIS API 기간별시세(월봉, FHKST03010100)로 월별 종가 리스트 확보 (일시 순단 방어 2회 시도)"""
     if not token:
         print(f"⚠️ [KIS 월봉] 토큰 없음 — KIS 경로를 건너뜁니다 ({ticker})")
         return None
-    try:
-        url = f"{URL_BASE}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
-        end = now_kst().strftime("%Y%m%d")
-        start = (now_kst() - dt.timedelta(days=730)).strftime("%Y%m%d")
-        params = {
-            "FID_COND_MRKT_DIV_CODE": "J",
-            "FID_INPUT_ISCD": ticker,
-            "FID_INPUT_DATE_1": start,
-            "FID_INPUT_DATE_2": end,
-            "FID_PERIOD_DIV_CODE": "M",
-            "FID_ORG_ADJ_PRC": "0",  # 수정주가 반영 (0: 수정주가, 1: 원주가)
-        }
-        res = kis_api_request("GET", url, headers=kis_headers(token, "FHKST03010100"), params=params)
-        if res.status_code == 200 and res.content:
-            data = res.json()
-            if data.get("rt_cd") == "0":
-                output2 = data.get("output2", [])
-                prices = []
-                for item in output2:
-                    px = to_float(item.get("stck_clpr"), 0.0)
-                    if px > 0:
-                        prices.append(px)
-                prices.reverse()  # 과거 -> 최신순
-                if len(prices) >= 14:
-                    return prices[-14:]
-    except Exception as e:
-        print(f"⚠️ KIS 월봉 시세 조회 오류 ({ticker}): {e}")
+    url = f"{URL_BASE}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
+    end = now_kst().strftime("%Y%m%d")
+    start = (now_kst() - dt.timedelta(days=730)).strftime("%Y%m%d")
+    params = {
+        "FID_COND_MRKT_DIV_CODE": "J",
+        "FID_INPUT_ISCD": ticker,
+        "FID_INPUT_DATE_1": start,
+        "FID_INPUT_DATE_2": end,
+        "FID_PERIOD_DIV_CODE": "M",
+        "FID_ORG_ADJ_PRC": "0",  # 수정주가 반영 (0: 수정주가, 1: 원주가)
+    }
+    for attempt in range(2):
+        try:
+            res = kis_api_request("GET", url, headers=kis_headers(token, "FHKST03010100"), params=params)
+            if res.status_code == 200 and res.content:
+                data = res.json()
+                if data.get("rt_cd") == "0":
+                    output2 = data.get("output2", [])
+                    prices = []
+                    for item in output2:
+                        px = to_float(item.get("stck_clpr"), 0.0)
+                        if px > 0:
+                            prices.append(px)
+                    prices.reverse()  # 과거 -> 최신순
+                    if len(prices) >= 14:
+                        return prices[-14:]
+        except Exception as e:
+            print(f"⚠️ KIS 월봉 시세 조회 오류 ({ticker}, 시도 {attempt + 1}/2): {e}")
+        if attempt == 0:
+            time.sleep(0.2)
     return None
 
 
@@ -1321,11 +1407,21 @@ def load_all_monthly(token, tickers):
 
 
 def fetch_prices(token, tickers, holdings_hint=None):
-    """3중 폴백 현재가: KIS 현재가 ➔ 잔고 보유단가(prpr) ➔ 월봉 최근 종가"""
-    holdings_hint = holdings_hint or {}
+    """4중 폴백 현재가: KIS 현재가 ➔ 잔고 보유단가(prpr) ➔ KIS 월봉 최근종가 ➔ Yahoo Finance"""
+    holdings_hint = holdings_hint if holdings_hint is not None else (_last_holdings_cache if token else {})
+    lazy_loaded = False
     prices = {}
     for t in tickers:
         px = get_current_price(token, t)
+        if not px and not holdings_hint and token and not lazy_loaded:
+            lazy_loaded = True
+            for acc in ACCOUNTS:
+                if acc.get("cano"):
+                    try:
+                        get_account_balance(token, acc["cano"], acc["prdt_cd"])
+                    except Exception:
+                        pass
+            holdings_hint = _last_holdings_cache
         if not px:
             px = int(holdings_hint.get(t, {}).get("price", 0)) or None
             if px: print(f"   ↩︎ {t} 현재가 폴백: 잔고단가 {px:,}원")
@@ -1459,6 +1555,21 @@ def main():
             print(f"🗓️ {now:%Y-%m-%d}은 주말/연말 증시 휴장일입니다. KIS 토큰 발급 및 텔레그램 알림 없이 정상 종료합니다 (Silent Holiday).")
             mark_clean_exit()
             return
+        if is_scheduled and not is_force and not (DRY_RUN or KIS_DRY_RUN):
+            if now.day < 17:
+                print(f"🗓️ {now:%Y-%m-%d}은 정기 리밸런싱 기간(17~31일) 이전입니다. 토큰 발급 없이 즉시 종료합니다.")
+                mark_clean_exit()
+                return
+            if now.time() < TRADE_OPEN:
+                print(f"⏰ 현재 {now:%H:%M:%S} KST는 장 시작({TRADE_OPEN:%H:%M}) 이전 선행 파동입니다. 토큰 발급 없이 즉시 종료합니다.")
+                mark_clean_exit()
+                return
+            after_hours_marker = f"after_hours_done={now:%Y-%m-%d}"
+            need_last_bday_report = (now.date() == last_bday and not has_sent_monthly_check_report(ym_str))
+            if now.time() > TRADE_DEADLINE and has_log_marker(ym_str, after_hours_marker) and not need_last_bday_report:
+                print(f"ℹ️ 오늘({now:%Y-%m-%d}) 장 마감 후 점검이 이미 완료({after_hours_marker})되었습니다. 토큰 발급 없이 종료합니다.")
+                mark_clean_exit()
+                return
 
     token = None
     if APP_KEY and APP_SECRET:
@@ -1489,15 +1600,15 @@ def main():
                 continue
             try:
                 skip, s_reason, _ = check_already_rebalanced_today(token, acc, target_weights, prices, read_only=True)
-                tag = "ℹ️" if "소액 계좌" in s_reason else ("✅" if (skip and "완료" in s_reason) else "🚨")
+                is_ok = _is_completed_status(skip, s_reason)
+                tag = "ℹ️" if "소액 계좌" in s_reason else ("✅" if is_ok else "🚨")
                 lines.append(f"{tag} {acc['name']}: {s_reason}")
             except Exception as ce:
                 lines.append(f"🚨 {acc['name']}: 점검 중 예외 발생 ({ce})")
 
         report = f"📅 [K-모멘텀] {now:%Y년 %m월} 월말 결산 생존 점검 ({now.day}일)\n" + "\n".join(lines)
         print(report)
-        send_telegram(report, raise_on_error=True)
-        if now.date() == last_bday:
+        if send_telegram(report, raise_on_error=True) is not False and now.date() == last_bday:
             mark_monthly_check_report_sent(ym_str)
         mark_clean_exit()
         return
@@ -1565,16 +1676,19 @@ def main():
         print("🧭 [무소음 스킵 (Silent Skip)] 전 계좌가 이미 이전 거래일에 당월 리밸런싱을 성공적으로 완료하였습니다.")
         for chk in account_checks:
             print(f"   - {chk['skip_reason']}")
+        if now.time() > TRADE_DEADLINE:
+            write_log_marker(ym_str, f"after_hours_done={now:%Y-%m-%d}")
         if now.date() == last_bday and not has_sent_monthly_check_report(ym_str):
             lines = []
             for chk in account_checks:
                 s_reason = chk["skip_reason"]
-                tag = "ℹ️" if "소액 계좌" in s_reason else ("✅" if (chk["skip"] and "완료" in s_reason) else "🚨")
+                is_ok = _is_completed_status(chk["skip"], s_reason)
+                tag = "ℹ️" if "소액 계좌" in s_reason else ("✅" if is_ok else "🚨")
                 lines.append(f"{tag} {chk['acc']['name']}: {s_reason}")
             report = f"📅 [K-모멘텀] {now:%Y년 %m월} 월말 결산 생존 점검 ({now.day}일)\n" + "\n".join(lines)
             print("   ➔ 오늘이 당월 마지막 영업일이므로 월말 결산 생존 점검 보고서를 1회 발송합니다.")
-            send_telegram(report)
-            mark_monthly_check_report_sent(ym_str)
+            if send_telegram(report) is not False:
+                mark_monthly_check_report_sent(ym_str)
         else:
             print("   ➔ 텔레그램 발송을 생략하고 세션을 조용히 정상 종료합니다.")
         print("=" * 62)
@@ -1599,12 +1713,19 @@ def main():
             mark_clean_exit()
             return
 
-    # 5. 거래 허용 시간창 게이트 (09:10 ~ 15:15 KST)
-    needs_work = [c["acc"]["name"] for c in account_checks if not c["skip"]]
+    # 5. 거래 허용 시간창 게이트 (09:10 ~ 15:15 KST) — API 지연 후 실시간 시각 재확인
+    now = now_kst()
+    needs_work = [
+        c["acc"]["name"]
+        for c in account_checks
+        if not _is_completed_status(c["skip"], c["skip_reason"])
+    ]
 
     if not (TRADE_OPEN <= now.time() <= TRADE_DEADLINE):
         msg = f"⏰ 현재 {now:%H:%M} KST는 정규장 거래창(09:10~15:15) 밖입니다. 슬리피지 방지를 위해 중단합니다."
         print(msg)
+        if now.time() > TRADE_DEADLINE:
+            write_log_marker(ym_str, f"after_hours_done={now:%Y-%m-%d}")
         if is_manual:
             send_telegram(f"🚨 [K-모멘텀] {msg}")
         elif needs_work:
@@ -1612,15 +1733,16 @@ def main():
                           f"{', '.join(needs_work)}는 오늘 집행하지 못했습니다. 다음 영업일 09:47에 재시도합니다.")
         else:
             print("   (당일 집행 완료 후 지연 도착한 확인 샷 — 무소음 종료)")
-            if now.date() == last_bday and not has_sent_monthly_check_report(ym_str):
+            if account_checks and now.date() == last_bday and not has_sent_monthly_check_report(ym_str):
                 lines = []
                 for chk in account_checks:
                     s_reason = chk["skip_reason"]
-                    tag = "ℹ️" if "소액 계좌" in s_reason else ("✅" if (chk["skip"] and "완료" in s_reason) else "🚨")
+                    is_ok = _is_completed_status(chk["skip"], s_reason)
+                    tag = "ℹ️" if "소액 계좌" in s_reason else ("✅" if is_ok else "🚨")
                     lines.append(f"{tag} {chk['acc']['name']}: {s_reason}")
                 report = f"📅 [K-모멘텀] {now:%Y년 %m월} 월말 결산 생존 점검 ({now.day}일)\n" + "\n".join(lines)
-                send_telegram(report)
-                mark_monthly_check_report_sent(ym_str)
+                if send_telegram(report) is not False:
+                    mark_monthly_check_report_sent(ym_str)
         mark_clean_exit()
         return
 
@@ -1628,6 +1750,7 @@ def main():
     send_telegram(f"🔔 [K-모멘텀] {now:%m/%d %H:%M} 리밸런싱 세션 시작 ({mode_str})")
 
     # 7. 다중 계좌 순회 집행 (계좌 완전 격리)
+    enforce_dl = not (KIS_MOCK or DRY_RUN or KIS_DRY_RUN)
     results = []
     for i, chk in enumerate(account_checks):
         acc = chk["acc"]
@@ -1647,7 +1770,7 @@ def main():
                 results.append(f"⏭️ {reason2}")
                 continue
 
-            report = rebalance_account(token, acc, target_weights, prices)
+            report = rebalance_account(token, acc, target_weights, prices, enforce_deadline=enforce_dl)
             results.append(report)
 
         except Exception as ae:
@@ -1669,15 +1792,15 @@ def main():
                 if not acc.get("cano"):
                     continue
                 sk, sr, _ = check_already_rebalanced_today(token, acc, target_weights, prices, read_only=True)
-                is_acc_ok = sk and ("완료" in sr or "소액 계좌" in sr)
+                is_acc_ok = _is_completed_status(sk, sr)
                 if not is_acc_ok:
                     all_done_now = False
                 tag = "ℹ️" if "소액 계좌" in sr else ("✅" if is_acc_ok else "🚨")
                 post_lines.append(f"{tag} {acc['name']}: {sr}")
             if all_done_now and post_lines:
                 report = f"📅 [K-모멘텀] {now:%Y년 %m월} 월말 결산 생존 점검 ({now.day}일)\n" + "\n".join(post_lines)
-                send_telegram(report)
-                mark_monthly_check_report_sent(ym_str)
+                if send_telegram(report) is not False:
+                    mark_monthly_check_report_sent(ym_str)
         except Exception as pe:
             print(f"⚠️ 말일 사후 점검 중 예외(무시): {pe}")
 

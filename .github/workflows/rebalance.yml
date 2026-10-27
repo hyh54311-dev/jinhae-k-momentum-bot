@@ -2,9 +2,11 @@ name: K-Dual Momentum Quant Bot Auto Rebalance
 
 on:
   schedule:
-    # [3발 분산 크론: 혼잡 파도 비껴가기 & 신용카드 0원 무인화]
-    # 매월 17~31일 하루 3번 번호표를 뽑아 혼잡을 비껴가는 3중 안전망 (월 최대 45회 기회 확보)
-    # 1발이 체결되면 봇 내장 '델타 수렴 멱등성 가드(현금 <= 1.5%)'가 2·3발을 0.1초 만에 자동 스킵
+    # [선행 2발 + 본대 3발 분산 크론: GitHub Actions 4~5시간 대기열 지연 완벽 보정 & 신용카드 0원 무인화]
+    # 매월 17~31일 선행 2발(05:17, 07:17 KST) + 본대 3발(09:47, 11:17, 12:47 KST)로 대기열 지연 유무와 무관하게 장중(09:10~15:15) 적중 보장
+    # 첫 발이 체결되면 봇 내장 '델타 수렴 멱등성 가드(현금 <= 1.5%)' 및 토큰 발급 전 시간창 가드가 후속 파동을 0.01~0.1초 만에 자동 스킵
+    - cron: '17 20 16-30 * *'   # 선행 1발: UTC 20:17(전일) = KST 05:17 (4.5~5.5시간 지연 시 09:47~10:47 KST 장중 적중, 조기 기동 시 0.01초 무소음 종료)
+    - cron: '17 22 16-30 * *'   # 선행 2발: UTC 22:17(전일) = KST 07:17 (2~5.5시간 지연 시 09:17~12:47 KST 장중 적중, 조기 기동 시 0.01초 무소음 종료)
     - cron: '47 0 17-31 * *'    # 1발: UTC 00:47 = KST 09:47 (장 초반 급변동 파도 지난 시점)
     - cron: '17 2 17-31 * *'    # 2발: UTC 02:17 = KST 11:17 (점심 전 파도)
     - cron: '47 3 17-31 * *'    # 3발: UTC 03:47 = KST 12:47 (점심시간 파도)
@@ -37,12 +39,14 @@ concurrency:
 
 jobs:
   rebalance:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          ref: main
 
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
@@ -85,15 +89,31 @@ jobs:
         if: always()
         run: |
           mkdir -p logs
+          LOG_FILE="logs/$(TZ='Asia/Seoul' date +%Y-%m).log"
+          SAVED_MARKERS=""
+          if [ -f "${LOG_FILE}" ]; then
+            SAVED_MARKERS="$(grep -E 'check_report=sent|after_hours_done=' "${LOG_FILE}" || true)"
+          fi
+          git checkout -- "${LOG_FILE}" 2>/dev/null || rm -f "${LOG_FILE}"
+          git pull --rebase --autostash || true
+          mkdir -p logs
+          if [ -n "${SAVED_MARKERS}" ]; then
+            while IFS= read -r marker_line; do
+              [ -z "${marker_line}" ] && continue
+              marker_key="$(echo "${marker_line}" | awk '{print $NF}')"
+              if ! grep -qF "${marker_key}" "${LOG_FILE}" 2>/dev/null; then
+                echo "${marker_line}" >> "${LOG_FILE}"
+              fi
+            done <<< "${SAVED_MARKERS}"
+          fi
           KST_TIME="$(TZ='Asia/Seoul' date +'%Y-%m-%d %H:%M:%S KST')"
           UTC_TIME="$(date -u +%FT%TZ)"
           echo "${KST_TIME} (${UTC_TIME}) run=${{ github.run_id }} status=${{ job.status }}" \
-            >> "logs/$(TZ='Asia/Seoul' date +%Y-%m).log"
+            >> "${LOG_FILE}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add logs
           git commit -m "chore(log): $(TZ='Asia/Seoul' date +'%Y-%m-%d') KST 실행 기록 [skip ci]" || exit 0
-          git pull --rebase --autostash || true
           if ! git push; then
             curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage" \
               -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \

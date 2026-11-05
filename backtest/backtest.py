@@ -346,6 +346,20 @@ def build_report():
     for y in sorted(set(d[:4] for d in dates)):
         pr(f"| {y} | " + " | ".join(f"{(math.prod(1+v for v, d in zip(series[k], dates) if d[:4]==y)-1)*100:.1f}" for k in keys) + " |")
 
+    # 2-b) 2026년 6월 시작 시나리오 (6월 말에 첫 매매 -> 7월부터 수익 반영, 전월 말 신호 사용)
+    i0 = MONTHS.index("2026-06")
+    pr("\n## 2026년 6월 말에 한꺼번에 투자했다면 (일시 투자, 월별 수익률 %)\n")
+    cols = [("K-듀얼모멘텀(현재 봇 로직)", lambda i: w_momentum(i - 1)), ("4자산 동일비중", lambda i: EQ),
+            ("코스피 보유", lambda i: {"KOSPI": 1.0})]
+    rs = {nm: simulate(wf, i0, last)[0] for nm, wf in cols}
+    pr("| 월 | " + " | ".join(n for n, _ in cols) + " | K-듀얼모멘텀 보유 비중 |")
+    pr("|---|" + "---|" * (len(cols) + 1))
+    for k, i in enumerate(range(i0, last)):
+        wt = w_momentum(i - 1)
+        wtxt = ", ".join(f"{NAMES[t]} {x*100:.0f}%" for t, x in sorted(wt.items(), key=lambda kv: -kv[1]))
+        pr(f"| {MONTHS[i+1]} | " + " | ".join(f"{rs[n][k]*100:.1f}" for n, _ in cols) + f" | {wtxt} |")
+    pr("| 누적 | " + " | ".join(f"{(math.prod(1+v for v in rs[n])-1)*100:.1f}" for n, _ in cols) + " | |")
+
     # 3) 리밸런싱 방식 (월 50만 원 적립)
     for lab, i0, i1 in windows()[:3]:
         pr(f"\n## 리밸런싱 방식 비교 / {lab} ({MONTHS[i0]} → {MONTHS[i1]}, 원금 {50*(i1-i0)/10000:.2f}억)\n")
@@ -395,6 +409,7 @@ def build_report():
     for nm, F, net in (("일반계좌 (정리 시 과세 포함)", Fg, net_g), ("연금저축 세전(세액공제 제외)", Fp, Fp),
                        ("연금저축 -> 연금 수령(5.5%)", Fp, Fp * .945), ("연금저축 -> 일시금(16.5%)", Fp, Fp * .835),
                        ("연금저축 + 세액공제 13.2% 재투자 -> 연금 수령", Fr1, Fr1 * .945),
+                       ("연금저축 + 세액공제 13.2% 재투자 -> 일시금(16.5%)", Fr1, Fr1 * .835),
                        ("연금저축 + 세액공제 16.5% 재투자 -> 연금 수령", Fr2, Fr2 * .945)):
         pr(f"| {nm} | {F/10000:.2f}억 | {net/10000:.2f}억 | {net/(paid*10000):.2f}배 | {irr_monthly_dca(net, 240):.1f}% |")
     gain_tax_base = ug / 0.154

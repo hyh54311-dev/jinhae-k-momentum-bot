@@ -59,6 +59,14 @@ TICKER_NAMES = {
     TICKER_SAFE: "TIGER 미국달러단기채권액티브",
 }
 
+# ── 전략 선택 ──────────────────────────────────────────────────────────────
+#   KIS_STRATEGY = "equal_weight" (기본, 4자산 동일비중 + 납입금 매수 + 5%p 이탈 규칙)
+#                | "momentum"     (기존 K-듀얼모멘텀. 되돌리기용으로 코드 그대로 보존)
+EQ_TICKERS = [TICKER_KOSPI, TICKER_SP500, TICKER_GOLD, TICKER_TLT]
+EQ_BAND = 0.05                  # 어떤 자산이든 목표(25%)에서 5%p 넘게 벗어나면 전체 재조정
+STRATEGY = "equal_weight"       # init_config()에서 환경 변수로 덮어씀
+STOCK_ACCOUNT_ENABLED = False   # 개인주식계좌 사용 여부 (KIS_STOCK_ENABLED=1 일 때만 포함)
+
 # 파라미터 상수
 BUY_BUFFER          = 0.995   # 매수 가용현금 안전 버퍼 (0.5% - 수수료 0.014% 대비 35배 안전마진)
 DRIFT_TOLERANCE     = 0.03    # 멱등성 판정용 기본 비중 허용 오차 (±3%p)
@@ -96,7 +104,7 @@ _last_holdings_cache = {}
 
 def init_config():
     """실행 직전 최신 환경 변수를 로드하여 전역 변수에 바인딩"""
-    global KIS_MOCK, KIS_DRY_RUN, DRY_RUN, MAX_ORDER_AMOUNT, APP_KEY, APP_SECRET, URL_BASE, ACCOUNTS, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, VERIFY_SSL
+    global KIS_MOCK, KIS_DRY_RUN, DRY_RUN, MAX_ORDER_AMOUNT, APP_KEY, APP_SECRET, URL_BASE, ACCOUNTS, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, VERIFY_SSL, STRATEGY, STOCK_ACCOUNT_ENABLED
     _last_holdings_cache.clear()
     
     env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
@@ -112,6 +120,12 @@ def init_config():
     MAX_ORDER_AMOUNT = int(os.getenv("MAX_ORDER_AMOUNT", "1000000000"))
     TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+    # 전략 선택: 오타가 있으면 조용히 다른 전략으로 매매하지 않도록 즉시 실패시킨다.
+    STRATEGY = (os.getenv("KIS_STRATEGY", "equal_weight") or "equal_weight").strip().lower()
+    if STRATEGY not in ("equal_weight", "momentum"):
+        raise ValueError(f"KIS_STRATEGY 값이 올바르지 않습니다: {STRATEGY!r} (equal_weight 또는 momentum)")
+    STOCK_ACCOUNT_ENABLED = os.getenv("KIS_STOCK_ENABLED", "0").strip().lower() in ("1", "true", "yes")
 
     if KIS_MOCK:
         APP_KEY = os.getenv("KIS_MOCK_APP_KEY", "")
@@ -136,8 +150,9 @@ def init_config():
         
         ACCOUNTS = [
             {"name": "연금저축계좌", "cano": pension_cano, "prdt_cd": "22", "taxable": False},
-            {"name": "개인주식계좌", "cano": stock_cano, "prdt_cd": "01", "taxable": True},
         ]
+        if STOCK_ACCOUNT_ENABLED:
+            ACCOUNTS.append({"name": "개인주식계좌", "cano": stock_cano, "prdt_cd": "01", "taxable": True})
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1052,7 +1067,7 @@ def check_already_rebalanced_today(token, acc, target_weights, prices, read_only
 # ──────────────────────────────────────────────────────────────────────────────
 # 8. [Q3-3] rebalance_account — 집행 엔진 (그리디 소진 패스 포함)
 # ──────────────────────────────────────────────────────────────────────────────
-def rebalance_account(token, acc, target_weights, prices, enforce_deadline: bool = False):
+def rebalance_account(token, acc, target_weights, prices, enforce_deadline: bool = False, no_sell: bool = False):
     name, cano, prdt_cd = acc["name"], acc["cano"], acc["prdt_cd"]
     print("\n" + "=" * 62)
     print(f"🔄 [{name}] 자산 리밸런싱 시작 ({cano}-{prdt_cd})")
@@ -1097,7 +1112,7 @@ def rebalance_account(token, acc, target_weights, prices, enforce_deadline: bool
             continue
         curr_qty = info["qty"]
         target_qty = target_qtys.get(ticker, 0)
-        if curr_qty <= target_qty:
+        if no_sell or curr_qty <= target_qty:   # no_sell: 납입금 매수 모드 (매도 없이 부족분만 매수)
             continue
 
         sell_qty = curr_qty - target_qty
@@ -1503,6 +1518,76 @@ def calculate_momentum_signals(token):
     return target_weights, reason
 
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 9-b. 4자산 동일비중 전략 (납입금 매수 + 5%p 이탈 시 전체 재조정)
+# ──────────────────────────────────────────────────────────────────────────────
+def plan_equal_weight(holdings: dict, ledger: int, band: float = EQ_BAND):
+    """
+    4자산(코스피·S&P500·금·미국장기채) 25% 동일비중 계획.
+
+    1) 전략 외 보유 종목(예: 기존 달러단기채)이 남아 있으면 → 전체 재조정 (최초 전환 포함)
+    2) 예수금(납입금)을 비중이 낮은 자산부터 배분했다고 가정했을 때,
+       어떤 자산이든 목표(25%)에서 band(5%p) 넘게 벗어나면 → 전체 재조정
+    3) 그렇지 않으면 → 납입금 매수 모드 (매도 없이 부족분만 매수)
+
+    반환: (target_weights, no_sell, reason)
+    평가액은 엔진의 총자산 산식과 동일하게 ledger + 보유 evlu_amt 를 쓴다.
+    """
+    n = len(EQ_TICKERS)
+    full = {t: 1.0 / n for t in EQ_TICKERS}
+    vals = {t: float(holdings.get(t, {}).get("eval_amt", 0) or 0) for t in EQ_TICKERS}
+    others = {t: float(h.get("eval_amt", 0) or 0)
+              for t, h in holdings.items()
+              if t not in EQ_TICKERS and h.get("qty", 0) > 0}
+    cash = float(max(ledger, 0))
+    total = cash + sum(vals.values()) + sum(others.values())
+    if total <= 0:
+        return full, False, "총자산 0원 — 계획 불가"
+
+    if others:
+        names = ", ".join(TICKER_NAMES.get(t, t) for t in others)
+        return full, False, f"전략 외 보유 종목({names}) 정리 — 4자산 전체 재조정"
+
+    # 납입금(예수금)을 비중이 낮은 자산부터 채움: 부족분 비례 배분, 다 채우고도 남으면 균등 배분
+    gap = {t: max(0.0, total / n - vals[t]) for t in EQ_TICKERS}
+    sg = sum(gap.values())
+    if sg > cash and sg > 0:
+        add = {t: cash * gap[t] / sg for t in EQ_TICKERS}
+    else:
+        extra = (cash - sg) / n
+        add = {t: gap[t] + extra for t in EQ_TICKERS}
+    post = {t: (vals[t] + add[t]) / total for t in EQ_TICKERS}
+    dev = max(abs(w - 1.0 / n) for w in post.values())
+    worst = max(post, key=lambda t: abs(post[t] - 1.0 / n))
+
+    if dev > band:
+        return full, False, (f"최대 이탈 {dev*100:.1f}%p({TICKER_NAMES[worst]}) > {band*100:.0f}%p "
+                             f"— 4자산 전체 재조정")
+    return post, True, (f"최대 이탈 {dev*100:.1f}%p ≤ {band*100:.0f}%p "
+                        f"— 납입금 매수 모드(매도 없음)")
+
+
+def get_strategy_targets(token):
+    """전략별 기본 목표 비중과 설명. (equal_weight 는 계좌별 계획으로 다시 조정된다.)"""
+    if STRATEGY == "equal_weight":
+        return ({t: 1.0 / len(EQ_TICKERS) for t in EQ_TICKERS},
+                "4자산 동일비중 (코스피·S&P500·금·미국장기채 25%씩)")
+    return calculate_momentum_signals(token)
+
+
+def account_targets(token, acc, base_weights):
+    """
+    계좌별 실제 목표 비중. 반환: (weights, no_sell, reason)
+    - momentum     : 전 계좌 공통 비중, 매도 허용
+    - equal_weight : 계좌 보유 현황을 읽어 plan_equal_weight 로 결정
+    """
+    if STRATEGY != "equal_weight":
+        return base_weights, False, ""
+    ledger, _, holdings = get_account_balance(token, acc["cano"], acc["prdt_cd"])
+    return plan_equal_weight(holdings, ledger)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 10. [Q3-4] main — 다중 계좌 완전 격리 실행 엔진
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1587,7 +1672,7 @@ def main():
         print(f"📅 [월말 결산 점검] {now:%Y-%m-%d %H:%M} KST — 전 계좌 생존 및 완료 상태 종합 검증 (당월 마지막 영업일: {last_bday})")
 
         try:
-            target_weights, reason = calculate_momentum_signals(token)
+            target_weights, reason = get_strategy_targets(token)
             prices = fetch_prices(token, list(target_weights))
         except Exception as se:
             print(f"⚠️ [월말 점검] 신호/가격 조회 실패({se}) — 현금비중 단독 점검 모드로 전환")
@@ -1599,7 +1684,8 @@ def main():
             if not acc.get("cano"):
                 continue
             try:
-                skip, s_reason, _ = check_already_rebalanced_today(token, acc, target_weights, prices, read_only=True)
+                acc_w, _ns, _why = account_targets(token, acc, target_weights)
+                skip, s_reason, _ = check_already_rebalanced_today(token, acc, acc_w, prices, read_only=True)
                 is_ok = _is_completed_status(skip, s_reason)
                 tag = "ℹ️" if "소액 계좌" in s_reason else ("✅" if is_ok else "🚨")
                 lines.append(f"{tag} {acc['name']}: {s_reason}")
@@ -1615,10 +1701,19 @@ def main():
 
     # ── DRY_RUN: 시간·휴장 게이트 이전에 '신호만' 계산해 보고하고 종료 ──
     if DRY_RUN or KIS_DRY_RUN:
-        tw, reason = calculate_momentum_signals(token)
+        tw, reason = get_strategy_targets(token)
         px = fetch_prices(token, list(tw))
         body = "\n".join(f"{TICKER_NAMES.get(t, t)}: {w*100:.1f}% @ {px.get(t, 0):,}원"
                           for t, w in tw.items())
+        if STRATEGY == "equal_weight" and token:
+            for _acc in ACCOUNTS:
+                if not _acc.get("cano"):
+                    continue
+                try:
+                    _w, _ns, _why = account_targets(token, _acc, tw)
+                    body += f"\n[{_acc['name']}] {_why}"
+                except Exception as _e:
+                    body += f"\n[{_acc['name']}] 계획 조회 실패: {_e}"
         print("🧪 [DRY-RUN] 목표 비중:\n" + body)
         send_telegram(f"🧪 [DRY-RUN] {now:%m/%d %H:%M} 목표 비중\n{body}\n(사유: {reason})")
         mark_clean_exit()
@@ -1633,7 +1728,7 @@ def main():
     # 2. 모멘텀 신호 산출 및 가격 수집
     signal_failed, signal_err = False, ""
     try:
-        target_weights, reason = calculate_momentum_signals(token)
+        target_weights, reason = get_strategy_targets(token)
         prices = fetch_prices(token, list(target_weights))
     except Exception as se:
         signal_failed, signal_err = True, str(se)
@@ -1649,7 +1744,10 @@ def main():
         if not acc.get("cano"):
             continue
         try:
-            skip, skip_reason, prior_completed = check_already_rebalanced_today(token, acc, target_weights, prices, read_only=True)
+            acc_w, _ns, _why = account_targets(token, acc, target_weights)
+            if _why:
+                print(f"   🧮 [{acc['name']}] {_why}")
+            skip, skip_reason, prior_completed = check_already_rebalanced_today(token, acc, acc_w, prices, read_only=True)
             account_checks.append({
                 "acc": acc,
                 "skip": skip,
@@ -1747,7 +1845,7 @@ def main():
         return
 
     # 6. 신규 집행 또는 당일 확인을 위한 세션 시작 알림 발송
-    send_telegram(f"🔔 [K-모멘텀] {now:%m/%d %H:%M} 리밸런싱 세션 시작 ({mode_str})")
+    send_telegram(f"🔔 [K-모멘텀] {now:%m/%d %H:%M} 리밸런싱 세션 시작 ({mode_str}, 전략: {STRATEGY})")
 
     # 7. 다중 계좌 순회 집행 (계좌 완전 격리)
     enforce_dl = not (KIS_MOCK or DRY_RUN or KIS_DRY_RUN)
@@ -1764,13 +1862,18 @@ def main():
                 results.append(f"⏭️ {chk['skip_reason']}")
                 continue
 
-            skip2, reason2, _ = check_already_rebalanced_today(token, acc, target_weights, prices, read_only=False)
+            acc_w, acc_no_sell, acc_why = account_targets(token, acc, target_weights)
+            if acc_why:
+                print(f"🧮 [{acc['name']}] {acc_why}")
+            skip2, reason2, _ = check_already_rebalanced_today(token, acc, acc_w, prices, read_only=False)
             if skip2:
                 print(f"🧭 {reason2}")
                 results.append(f"⏭️ {reason2}")
                 continue
 
-            report = rebalance_account(token, acc, target_weights, prices, enforce_deadline=enforce_dl)
+            report = rebalance_account(token, acc, acc_w, prices, enforce_deadline=enforce_dl, no_sell=acc_no_sell)
+            if acc_why:
+                report = f"{report}\n🧮 {acc_why}"
             results.append(report)
 
         except Exception as ae:
@@ -1791,7 +1894,8 @@ def main():
             for acc in ACCOUNTS:
                 if not acc.get("cano"):
                     continue
-                sk, sr, _ = check_already_rebalanced_today(token, acc, target_weights, prices, read_only=True)
+                acc_w, _ns, _why = account_targets(token, acc, target_weights)
+                sk, sr, _ = check_already_rebalanced_today(token, acc, acc_w, prices, read_only=True)
                 is_acc_ok = _is_completed_status(sk, sr)
                 if not is_acc_ok:
                     all_done_now = False

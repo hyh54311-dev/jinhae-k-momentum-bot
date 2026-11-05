@@ -76,6 +76,11 @@ jobs:
           MAX_ORDER_AMOUNT: ${{ secrets.MAX_ORDER_AMOUNT || '1000000000' }}
           GITHUB_EVENT_NAME: ${{ github.event_name }}
           MANUAL_CHECK_ONLY: ${{ github.event.inputs.check_only == 'true' && '1' || '0' }}
+          # 전략 선택 (Settings > Secrets and variables > Actions > Variables 에서 변경, 코드 수정 불필요)
+          #   KIS_STRATEGY = equal_weight(기본, 4자산 동일비중) | momentum(기존 K-듀얼모멘텀으로 되돌리기)
+          KIS_STRATEGY: ${{ vars.KIS_STRATEGY || 'equal_weight' }}
+          #   KIS_STOCK_ENABLED = 1 이면 개인주식계좌도 함께 리밸런싱 (기본 0: 연금저축계좌만)
+          KIS_STOCK_ENABLED: ${{ vars.KIS_STOCK_ENABLED || '0' }}
         run: |
           if [ "${{ github.event.schedule }}" = "0 5 25-31 * *" ] || [ "${{ github.event.inputs.check_only }}" = "true" ]; then
             python kis_bot_multi.py --check-only

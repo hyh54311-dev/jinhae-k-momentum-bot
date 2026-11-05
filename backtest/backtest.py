@@ -346,6 +346,43 @@ def build_report():
     for y in sorted(set(d[:4] for d in dates)):
         pr(f"| {y} | " + " | ".join(f"{(math.prod(1+v for v, d in zip(series[k], dates) if d[:4]==y)-1)*100:.1f}" for k in keys) + " |")
 
+    # 2-a) 최대 낙폭이 언제 생겼나 (고점 월 -> 저점 월), -15% 넘는 낙폭 구간 전부
+    pr("\n## 낙폭 -15%를 넘은 구간 (최장 구간, 고점 월 → 저점 월 / 깊이)\n")
+    pr("| 전략 | 낙폭 구간 |")
+    pr("|---|---|")
+    for k in keys:
+        r = series[k]
+        eqv, pk, pkd = 1.0, 1.0, MONTHS[12]
+        eps, cur = [], None
+        for v, d in zip(r, dates):
+            eqv *= 1 + v
+            if eqv >= pk:
+                if cur and cur[2] <= -0.15:
+                    eps.append(cur)
+                pk, pkd, cur = eqv, d, None
+            else:
+                dd = eqv / pk - 1
+                if cur is None or dd < cur[2]:
+                    cur = (pkd, d, dd)
+        if cur and cur[2] <= -0.15:
+            eps.append(cur)
+        txt = ", ".join(f"{a}→{b} {c*100:.1f}%" for a, b, c in eps) or "없음"
+        pr(f"| {k} | {txt} |")
+
+    # 2-c) 매매비용 민감도 (최장 구간)
+    pr("\n## 매매비용 민감도 (최장 구간, 연평균 / 최대 낙폭)\n")
+    pr("| 전략 | 편도 0.05% (기본) | 편도 0.15% | 편도 0.30% |")
+    pr("|---|---|---|---|")
+    for nm, wf in STRATS[1:5]:
+        cells = []
+        for c in (0.0005, 0.0015, 0.003):
+            x = stats(simulate(wf, 12, last, cost=c)[0])
+            cells.append(f"{x['cagr']:.2f}% / {x['mdd']:.1f}%")
+        pr(f"| {nm} | " + " | ".join(cells) + " |")
+    for c in (0.0005, 0.0015, 0.003):
+        x = run_dca(12, last, "cf_band", cost=c)
+        pr(f"| 4자산 납입금 매수 + 5%p (적립식, 편도 {c*100:.2f}%) | 최종 {x['final']:.2f}억, 시간가중 {x['cagr']:.2f}% | | |")
+
     # 2-b) 2026년 6월 시작 시나리오 (6월 말에 첫 매매 -> 7월부터 수익 반영, 전월 말 신호 사용)
     i0 = MONTHS.index("2026-06")
     pr("\n## 2026년 6월 말에 한꺼번에 투자했다면 (일시 투자, 월별 수익률 %)\n")
